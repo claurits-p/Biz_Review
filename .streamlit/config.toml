@@ -1,0 +1,10 @@
+[theme]
+# Navy/dark-blue theme to replace Streamlit's default red-orange accent.
+primaryColor = "#1e40af"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#eef2ff"
+textColor = "#0f172a"
+font = "sans serif"
+
+[server]
+headless = true

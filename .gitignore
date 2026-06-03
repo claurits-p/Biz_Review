@@ -1,0 +1,20 @@
+# Secrets — never commit
+.streamlit/secrets.toml
+*.json
+!package.json
+
+# Local persistence stores (reset on cloud; move to BigQuery later)
+*_store.json
+goals_store.json
+snapshots_store.json
+actions_store.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
