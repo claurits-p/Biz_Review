@@ -30,15 +30,18 @@ PRIMARY_MARKETS = ["NetSuite", "Sage", "Dynamics"]
 OTHER_MARKETS = ["Acumatica", "Broad Market"]
 MARKET_ORDER = PRIMARY_MARKETS + ["Other"]
 
-def market_bucket(erp: str) -> str:
-    return erp if erp in PRIMARY_MARKETS else "Other"
+def market_bucket(erp) -> str:
+    s = "" if erp is None else str(erp)
+    return s if s in PRIMARY_MARKETS else "Other"
 
 # GTM engines (off sql_generated_by). V2 cares about Channel, Marketing, BDR, AE.
 GTM_ENGINES = ["Channels", "Marketing", "BDR", "AE", "Other"]
 GTM_EXCLUDE = ["CS"]  # customer success is not a new-business acquisition engine
 
-def gtm_bucket(src: str) -> str:
-    s = str(src or "").lower()
+def gtm_bucket(src) -> str:
+    s = ("" if src is None else str(src)).lower()
+    if s in ("nan", "none", "<na>", "nat"):
+        return "Other"
     if any(k in s for k in ("channel", "partner", "var", "referral")):
         return "Channels"
     if any(k in s for k in ("marketing", "inbound", "demand", "web", "event", "content")):
@@ -50,10 +53,12 @@ def gtm_bucket(src: str) -> str:
     return "Other"
 
 # Product (off use_case, order-independent). AR / AP / Multi-Product.
-def product_bucket(use_case: str) -> str:
-    if not use_case:
+def product_bucket(use_case) -> str:
+    # Robust to None / float NaN / pandas NA / Arrow-backed strings (Streamlit Cloud).
+    s = "" if use_case is None else str(use_case)
+    if not s or s.strip().lower() in ("nan", "none", "<na>", "nat"):
         return "Unknown"
-    parts = {p.strip().upper() for p in use_case.replace(";", ",").split(",") if p.strip()}
+    parts = {p.strip().upper() for p in s.replace(";", ",").split(",") if p.strip()}
     has_ar = "AR" in parts
     has_ap = "AP" in parts or "EXPENSE MANAGEMENT" in parts or "CORPORATE CARDS" in parts
     if has_ar and has_ap:
