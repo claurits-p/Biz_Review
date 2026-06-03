@@ -58,6 +58,21 @@ def latest_before(snapshot_date: dt.date):
     return prior[-1], data[prior[-1]]
 
 
+def prior_week(snapshot_date: dt.date, target_gap_days: int = 7):
+    """Return (date, metrics) of the snapshot closest to ~target_gap_days before snapshot_date.
+
+    This is the correct basis for Week-over-Week: it deliberately skips snapshots captured
+    a day or two ago (the app writes one on every load) and instead picks the one nearest to
+    'a week ago', so WoW reflects a real week of movement — not day-over-day noise (≈0%)."""
+    data = _load()
+    cands = [d for d in data if d < snapshot_date.isoformat()]
+    if not cands:
+        return None, None
+    target = snapshot_date - dt.timedelta(days=target_gap_days)
+    best = min(cands, key=lambda d: abs((dt.date.fromisoformat(d) - target).days))
+    return best, data[best]
+
+
 def history() -> list:
     """All snapshots as a sorted list of (date_iso, metrics)."""
     data = _load()

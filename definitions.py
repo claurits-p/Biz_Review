@@ -87,6 +87,49 @@ STRATEGIC_PRIORITIES = [
     "Global FX motion",
 ]
 
+# Plain-language definitions surfaced as ⓘ tooltips and a "How to read this" panel,
+# so anyone can present the deck without memorizing the metric logic.
+GLOSSARY = {
+    "QTD": "Quarter-to-Date: counts/dollars accumulated from the first day of the quarter "
+           "through the snapshot date.",
+    "Quarter elapsed": "How far through the quarter we are by calendar days "
+                       "(days into quarter ÷ total days). It's the 'pace' line: a metric at "
+                       "X% of plan is exactly on pace when X% of the quarter has elapsed.",
+    "Pace": "The % of the quarter that has elapsed by calendar days. We compare attainment "
+            "against pace — above pace = ahead of schedule, below = behind.",
+    "SQL-Booked": "Sales-Qualified Leads booked: deals that entered the Sales Pipeline "
+                  "(HubSpot createdate) during the period. Measures pipeline creation.",
+    "SQL-Held": "SQL-Booked deals where the discovery/first meeting actually happened "
+                "(discovery_call_date in period AND meeting_happened = Yes).",
+    "SAL": "Sales-Accepted Leads: deals AEs accepted as real opportunities (sal_date in period).",
+    "Pipeline ARR": "Annual Recurring Revenue of deals created in the period (new pipeline $).",
+    "Pipeline ACV": "Annual Contract Value (AR + AP) of deals created in the period.",
+    "Bookings ARR": "ARR of deals Closed-Won in the period — revenue actually booked.",
+    "Bookings ACV": "Annual Contract Value (AR + AP) of deals Closed-Won in the period.",
+    "ARR vs ACV": "ARR = recurring software revenue. ACV = total annual contract value "
+                  "including AR and AP. ACV ≥ ARR for the same deal.",
+    "WoW": "Week-over-Week change vs the prior weekly snapshot. Shows momentum, not just level.",
+    "Commit": "Deals the rep is confident will close this quarter (HubSpot forecast category = Commit). "
+              "Treated as the high-confidence number.",
+    "Best Case": "Upside deals that could close with effort (HubSpot forecast category = Best Case).",
+    "Pipeline coverage": "Open pipeline ARR ÷ remaining gap to plan. Benchmark ≥ 3× — i.e. you "
+                         "typically need 3x the gap in open pipeline to cover normal loss rates.",
+    "Weighted": "Σ (deal ACV × HubSpot deal-stage probability). A probability-adjusted forecast "
+                "using HubSpot's own stage odds — not invented weights.",
+    "Forecast discipline": "Share of open deals that carry a rep forecast category. Low = reps "
+                           "aren't calling their deals, so the forecast is less trustworthy.",
+    "RAG": "Red / Amber / Green health rating from risk flags + MEDDPICC completeness + pace.",
+    "MEDDPICC": "Deal-qualification score (Metrics, Economic buyer, Decision criteria/process, "
+                "Paper process, Identified pain, Champion, Competition). Shown out of 5 trackable "
+                "elements (Champion field is empty in CRM).",
+}
+
+
+def help_for(*keys) -> str:
+    """Compose a tooltip string from one or more glossary keys."""
+    return "  •  ".join(GLOSSARY[k] for k in keys if k in GLOSSARY)
+
+
 def fmt_triple(current, wow_pct, attainment_pct, money=False):
     """Consistent metric language: '78 (+12%, 80%)' or '$450K (+8%, 72%)'.
     Components that aren't available yet (no prior snapshot / no goal set) are shown as '–',
