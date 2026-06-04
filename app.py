@@ -11,6 +11,7 @@ talking points). Drill-down = the full scrolling dashboard with supporting detai
 (watchlist, wins, full pipeline). Everything is dynamic off the snapshot date.
 """
 import datetime as dt
+import re
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -31,6 +32,51 @@ _tpl.title.xanchor = "left"
 _tpl.legend.title.text = ""
 px.defaults.template = "plotly_white"
 px.defaults.color_discrete_sequence = NAVY_SEQ
+
+# Streamlit renders `$...$` in *markdown text* as LaTeX math, so money like "$813K … $279K"
+# gets typeset as italics. The fix is to escape `$` -> `\$` in plain markdown text; inside raw
+# HTML (unsafe_allow_html=True) there's no LaTeX pass, so we use the `$` HTML entity there (a `\$`
+# would show a literal backslash). (Metrics/dataframes aren't markdown, so they're untouched.)
+#
+# CRITICAL: patch exactly once. Streamlit re-executes this script on every rerun, but the `st`
+# module is cached in sys.modules, so without this guard each rerun would capture the
+# already-patched functions as "originals" and re-wrap them — making the escaping compound into
+# "\\\\\\$" over time.
+# Idempotent: collapse any prior escaping first, then re-escape exactly once. This guarantees the
+# output is always a single `\$` (or single `&#36;` entity) no matter how many times it runs, so
+# stacked wrappers / reruns can never compound into "\\\\\\$".
+def _esc_dollars(text):
+    if not isinstance(text, str):
+        return text
+    return text.replace("\\$", "$").replace("$", "\\$")
+
+
+def _html_dollars(text):
+    if not isinstance(text, str):
+        return text
+    return text.replace("&#36;", "$").replace("$", "&#36;")
+
+
+if not getattr(st, "_bizreview_dollar_patched", False):
+    _st_markdown, _st_caption, _st_write = st.markdown, st.caption, st.write
+
+    def _safe_markdown(body="", *a, **k):
+        if isinstance(body, str):
+            # HTML: use the `$` entity (renders as $, no LaTeX, no literal backslash).
+            # Plain markdown: escape `$` -> `\$`.
+            body = _html_dollars(body) if k.get("unsafe_allow_html") else _esc_dollars(body)
+        return _st_markdown(body, *a, **k)
+
+    def _safe_caption(body="", *a, **k):
+        if not k.get("unsafe_allow_html"):
+            body = _esc_dollars(body)
+        return _st_caption(body, *a, **k)
+
+    def _safe_write(*a, **k):
+        return _st_write(*(_esc_dollars(x) for x in a), **k)
+
+    st.markdown, st.caption, st.write = _safe_markdown, _safe_caption, _safe_write
+    st._bizreview_dollar_patched = True
 
 import data
 import analytics
@@ -77,8 +123,11 @@ FCAT_COLORS = {"Commit": "#1e40af", "Best Case": "#3b82f6", "Pipeline": "#93c5fd
 STAGE_COLORS = {"SQL-Booked": "#1e40af", "SQL-Held": "#3b82f6", "SAL": "#93c5fd"}
 METRIC_LABELS = {"sql_booked": "SQL-Booked", "sql_held": "SQL-Held", "sal": "SAL",
                  "pipeline_arr": "Pipeline ARR", "bookings_arr": "Bookings ARR"}
-MONEY = {"pipeline_arr", "bookings_arr", "pipeline_acv", "bookings_acv"}
+MONEY = {"pipeline_arr", "bookings_arr", "pipeline_acv", "bookings_acv",
+         "pipeline_arr_sal", "pipeline_acv_sal"}
 ALL_METRICS = analytics.FUNNEL_METRICS
+SAL_METRICS = analytics.SAL_PIPELINE_METRICS
+TOT_METRICS = ALL_METRICS + SAL_METRICS
 
 # HubSpot deep links — progressive disclosure (V2): the deck answers "what", these dashboards
 # answer "why". Portal + dashboard view ids are the company's own, taken from the live deck.
@@ -122,6 +171,16 @@ def load_tof(today_iso: str):
     base = analytics.enrich_qtd(data.qtd_base(p["quarter_start"], today), p["quarter_start"], today)
     wow = data.wow_sql(today)
     return p, base, wow
+
+
+@st.cache_data(ttl=3600)
+def load_wow_funnel(today_iso: str):
+    return data.wow_funnel(dt.date.fromisoformat(today_iso))
+
+
+@st.cache_data(ttl=3600)
+def load_pace_history(today_iso: str):
+    return data.pace_history(dt.date.fromisoformat(today_iso))
 
 
 @st.cache_data(ttl=3600)
@@ -183,6 +242,24 @@ def attainment(market, metric, actual):
     return 100 * actual / g if g else None
 
 
+def company_attainment(metric):
+    """Company-level % of plan, apples-to-apples: sum actuals ONLY for markets that have a goal
+    set, against the sum of those goals. Prevents the distortion where all-market actuals are
+    compared to a goal set for just one market (which produced nonsense like '590% to plan')."""
+    mf = market_funnel.set_index("market")
+    gsum = act = 0.0
+    have = 0
+    for mk in MARKET_ORDER:
+        g = goalstore.goal_for(qkey, mk, metric) or 0
+        if g:
+            gsum += g
+            act += float(mf.loc[mk, metric]) if (mk in mf.index and metric in mf.columns) else 0.0
+            have += 1
+    if not gsum:
+        return None, 0
+    return 100 * act / gsum, have
+
+
 def wow_pct(market=None):
     if market is None:
         tw, lw = wow["this_week"].sum(), wow["last_week"].sum()
@@ -194,7 +271,19 @@ def wow_pct(market=None):
 
 
 def company_totals():
-    return market_funnel[ALL_METRICS].sum()
+    cols = [c for c in TOT_METRICS if c in market_funnel.columns]
+    return market_funnel[cols].sum()
+
+
+def erp_split(metric_col, money_fmt=False):
+    """Format the strategic-ERP breakdown of a funnel metric (Will's #1 ask: never show a
+    topline SQL number without the NetSuite/Sage/Dynamics split underneath it)."""
+    mf = market_funnel.set_index("market")
+    parts = []
+    for mk in MARKET_ORDER:
+        v = float(mf.loc[mk, metric_col]) if mk in mf.index and metric_col in mf.columns else 0.0
+        parts.append(f"<b>{mk}</b> {money(v) if money_fmt else f'{v:,.0f}'}")
+    return " · ".join(parts)
 
 
 def rag_status(att, pace_pct):
@@ -203,9 +292,15 @@ def rag_status(att, pace_pct):
     return "Green" if att >= pace_pct else ("Yellow" if att >= pace_pct - 20 else "Red")
 
 
+def _md_bold(s):
+    """Convert markdown **bold** to <b>bold</b> for HTML callouts (where ** won't render)."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s) if isinstance(s, str) else s
+
+
 def decision_callout(question, read, decision):
     """V2: every section answers a business question and leads to a decision — not activity.
     Renders question → what the data says → the recommended decision."""
+    question, read, decision = _md_bold(question), _md_bold(read), _md_bold(decision)
     st.markdown(
         f"<div style='background:#eef2ff;border-left:5px solid {PRIMARY};padding:8px 14px;"
         f"border-radius:6px;margin:2px 0 10px'>"
@@ -218,6 +313,7 @@ def decision_callout(question, read, decision):
 def rag_pill(label, status, sub=""):
     c = RAG.get(status, NEUTRAL)
     dot = "●" if status in RAG else "◌"
+    label, sub = _md_bold(label), _md_bold(sub)
     st.markdown(
         f"<div style='background:{c}1a;border-left:6px solid {c};padding:10px 14px;"
         f"border-radius:6px;margin-bottom:8px'><b>{label}</b> "
@@ -326,16 +422,14 @@ def slide_header(idx, total, title, subtitle=""):
 
 
 def talking_points(slide_id):
-    """Editable qualitative commentary that persists per quarter+meeting+slide.
-    This is the layer Looker can't do — and where the Gong+HubSpot agent will
-    later auto-draft the narrative."""
-    with st.expander("🗒  Talking points / commentary", expanded=True):
+    """Editable qualitative commentary that persists per quarter+meeting+slide."""
+    with st.expander("Talking points / commentary", expanded=True):
         cur = notes.get(qkey, meeting, slide_id)
         txt = st.text_area(
             "notes", value=cur, key=f"tp_{meeting}_{slide_id}_{qkey}",
             label_visibility="collapsed", height=90,
-            placeholder="Add qualitative context for this slide — what's behind the numbers, "
-                        "what to say in the room. (The AI will draft these from Gong + HubSpot later.)")
+            placeholder="Add qualitative context for this slide — what's behind the numbers and "
+                        "what to say in the room.")
         if txt != cur:
             notes.set_note(qkey, meeting, slide_id, txt)
 
@@ -379,119 +473,190 @@ if meeting == "TOF Review":
     gtm["held_rate"] = (gtm["sql_held"] / _sb * 100).round(0)
     gtm["sal_rate"] = (gtm["sal"] / _sh * 100).round(0)
 
-    def s_title():
-        st.markdown(f"<div class='hero-q'>{core_q}</div>", unsafe_allow_html=True)
-        c = st.columns(4)
-        c[0].metric("SQL-Booked (QTD)", f"{tot['sql_booked']:,.0f}", help=help_for("SQL-Booked", "QTD"))
-        c[1].metric("SQL-Held (QTD)", f"{tot['sql_held']:,.0f}", help=help_for("SQL-Held"))
-        c[2].metric("Bookings ARR (QTD)", money(tot["bookings_arr"]), help=help_for("Bookings ARR"))
-        c[3].metric("Quarter elapsed", f"{pace:.0f}%", help=help_for("Quarter elapsed"))
-        st.markdown(pacing_line())
-        st.caption(f"Updated {pacing['today']:%A, %b %d %Y} · hover any ⓘ for a definition · "
-                   "use ◀ / ▶ above to move through the deck.")
-        how_to_read(["SQL-Booked", "SQL-Held", "SAL", "Pipeline ARR", "Pipeline ACV",
-                     "Bookings ARR", "Bookings ACV", "ARR vs ACV", "QTD", "Quarter elapsed", "WoW"])
-
     def s_exec():
-        bk_att = 100 * tot["bookings_arr"] / goal_sum("bookings_arr") if goal_sum("bookings_arr") else None
+        # Slide 1 = the whole story in one frame (V2: "understand business health within the first
+        # few minutes"; Will: "page one is quarter-to-date, high level — no week-over-week here").
+        bk_att, _bk_have = company_attainment("bookings_arr")
+        sqlb_att, _sqlb_have = company_attainment("sql_booked")
         sqlb = tot["sql_booked"]
         sqlb_proj = sqlb / (pace / 100) if pace else sqlb
-        sqlb_goal = goal_sum("sql_booked")
-        decision_callout(
-            "Will we create enough future revenue?",
-            f"SQL-Booked {sqlb:,.0f}, projecting **{sqlb_proj:,.0f}** by quarter-end"
-            + (f" vs {sqlb_goal:,.0f} plan" if sqlb_goal else "")
-            + f"; Bookings {money(tot['bookings_arr'])}"
-            + (f" = {bk_att:.0f}% of plan at {pace:.0f}% elapsed" if bk_att is not None else "")
-            + ".",
-            ("Pipeline creation is behind pace — increase BDR/Channel investment or intervene."
-             if (sqlb_goal and sqlb_proj < sqlb_goal) else
-             "Top-of-funnel is on/above pace — hold investment and protect conversion."))
+
+        # One clean north-star QTD strip (no WoW — that's the next slide). '% of plan' shown as a
+        # plain caption (not a delta) so there's no misleading up/down arrow.
+        k = st.columns(5)
+        kpis = [("sql_booked", "SQL-Booked", "SQL-Booked", False),
+                ("sql_held", "SQL-Held", "SQL-Held", False),
+                ("sal", "SAL", "SAL", False),
+                ("pipeline_arr_sal", "Pipeline (SAL-qual.)", "SAL-qualified pipeline", True),
+                ("bookings_arr", "Bookings ARR", "Bookings ARR", True)]
+        for i, (m, lbl, gl, ismoney) in enumerate(kpis):
+            att = company_attainment(m)[0] if m in ("sql_booked", "sql_held", "sal", "bookings_arr") else None
+            val = money(tot[m]) if ismoney else f"{tot[m]:,.0f}"
+            k[i].metric(lbl, val, help=help_for(gl))
+            k[i].caption(f"{att:.0f}% of plan" if att is not None else "goal not set")
+        st.markdown(f"<div style='background:#f1f5f9;border-radius:6px;padding:8px 14px;margin:6px 0 4px'>"
+                    f"<span style='color:#64748b;font-weight:700;font-size:.8rem;text-transform:uppercase;"
+                    f"letter-spacing:.06em'>SQL-Booked by strategic ERP</span><br>{erp_split('sql_booked')}"
+                    f"</div>", unsafe_allow_html=True)
+        st.caption(f"**% of plan** = QTD result ÷ this quarter's goal (set in the sidebar). Compare it to "
+                   f"**quarter elapsed ({pace:.0f}%)**: above that = ahead of pace, below = behind. "
+                   + pacing_line())
+
         status = rag_status(bk_att, pace) or "Yellow"
         rag_pill("Quarter health (Bookings ARR vs pace)", status,
                  f"{bk_att:.0f}% of plan at {pace:.0f}% of quarter elapsed"
                  if bk_att is not None else "Set Bookings ARR goals in the sidebar to activate RAG")
+        decision_callout(
+            "Will we create enough future revenue?",
+            f"SQL-Booked {sqlb:,.0f}, projecting **{sqlb_proj:,.0f}** by quarter-end"
+            + (f" ({sqlb_att:.0f}% of plan)" if sqlb_att is not None else "")
+            + f"; Bookings {money(tot['bookings_arr'])}"
+            + (f" = {bk_att:.0f}% of plan at {pace:.0f}% elapsed" if bk_att is not None else "")
+            + ".",
+            ("Pipeline creation is behind pace — increase BDR/Channel investment or intervene."
+             if (sqlb_att is not None and sqlb_att < pace) else
+             "Top-of-funnel is on/above pace — hold investment and protect conversion."))
 
-        r1 = st.columns(3)
-        for i, metric in enumerate(["sql_booked", "sql_held", "sal"]):
-            actual = tot[metric]
-            g = goal_sum(metric)
-            att = 100 * actual / g if g else None
-            w = wow_pct() if metric == "sql_booked" else snap_delta(f"tof_{metric}", actual)
-            parts = []
-            if w is not None:
-                parts.append(f"{w:+.0f}% WoW")
-            if att is not None:
-                parts.append(f"{att:.0f}% plan")
-            r1[i].metric(METRIC_LABELS[metric], f"{actual:,.0f}", " · ".join(parts) or None,
-                         help=help_for(METRIC_LABELS[metric]))
-        r2 = st.columns(4)
-        for i, (m, lbl) in enumerate([("pipeline_arr", "Pipeline ARR"), ("pipeline_acv", "Pipeline ACV"),
-                                      ("bookings_arr", "Bookings ARR"), ("bookings_acv", "Bookings ACV")]):
-            g = goal_sum(m)
-            att = 100 * tot[m] / g if g else None
-            w = snap_delta(f"tof_{m}", tot[m])
-            parts = []
-            if w is not None:
-                parts.append(f"{w:+.0f}% WoW")
-            if att is not None:
-                parts.append(f"{att:.0f}% plan")
-            r2[i].metric(lbl, money(tot[m]), " · ".join(parts) or None, help=help_for(lbl))
-        st.caption("Metric language: **value (WoW Δ, % to plan)** per the V2 spec. WoW compares to the "
-                   "snapshot from ~a week ago (reconstructed back to quarter start, so it's live now — "
-                   "not day-over-day).")
-
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            won = int(base["is_book"].sum())
-            fig = go.Figure(go.Funnel(y=["SQL-Booked", "SQL-Held", "SAL", "Won"],
-                            x=[tot["sql_booked"], tot["sql_held"], tot["sal"], won],
-                            textinfo="value+percent initial", marker={"color": PRIMARY}))
-            fig.update_layout(title="Funnel (QTD)", height=320, margin=dict(t=40, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            st.markdown("**Run-rate projection (linear)**")
-            for m, lbl in [("sql_booked", "SQL-Booked"), ("bookings_arr", "Bookings ARR")]:
-                proj = tot[m] / (pace / 100) if pace else tot[m]
-                g = goal_sum(m)
-                disp = money(proj) if m in MONEY else f"{proj:,.0f}"
-                gd = money(g) if m in MONEY else f"{g:,.0f}"
-                st.write(f"- **{lbl}:** projecting **{disp}** by quarter-end" + (f" vs {gd} plan" if g else ""))
-            st.caption("Linear pace = QTD ÷ % elapsed.")
-
-        # Cumulative pace vs target (real QTD data — no snapshot needed)
+        # Cumulative pace vs target + context (prior quarter, trailing-4-qtr avg, run-rate forecast).
+        # Will: "$600K means nothing without a reference" — these lines say are-we-tracking at a glance.
         qs_ts = pd.Timestamp(pacing["quarter_start"])
         q = (today.month - 1) // 3
         q_end = dt.date(today.year + (q == 3), ((q + 1) % 4) * 3 + 1, 1) - dt.timedelta(days=1)
         days = pd.date_range(qs_ts, pd.Timestamp(today))
+        day_in_q = pacing["days_in_quarter"]
+        today_doq = max(pacing["days_into_quarter"], 1)
+        full_dates = pd.date_range(qs_ts, periods=day_in_q)
         pace_metric = st.radio("Pace chart", ["Bookings ARR", "SQL-Booked"], horizontal=True, key="pacem")
         if pace_metric == "Bookings ARR":
             s = base[base["is_book"]].copy()
             s["d"] = pd.to_datetime(s["close_d"])
             daily = s.groupby(s["d"].dt.normalize())["arr"].sum()
             goal = goal_sum("bookings_arr")
-            ylab = "Cumulative Bookings ARR ($)"
+            ylab, metric_key = "Cumulative Bookings ARR ($)", "bookings_arr"
         else:
             s = base[base["is_sql"]].copy()
             s["d"] = pd.to_datetime(s["create_d"])
             daily = s.groupby(s["d"].dt.normalize()).size()
             goal = goal_sum("sql_booked")
-            ylab = "Cumulative SQL-Booked"
+            ylab, metric_key = "Cumulative SQL-Booked", "sql_booked"
         cum = daily.reindex(days, fill_value=0).cumsum()
         fig = go.Figure()
+        # Benchmark context first (so the bold actual line sits on top).
+        ph = load_pace_history(today.isoformat())
+        curves = analytics.quarter_pace_curves(ph, metric_key, today, day_in_q)
+        if curves.get("avg4") is not None:
+            fig.add_trace(go.Scatter(x=full_dates, y=curves["avg4"].values, mode="lines",
+                                     name="Last-4-qtr avg pace", line={"color": "#c7d2fe", "width": 2}))
+        if curves.get("prior") is not None:
+            fig.add_trace(go.Scatter(x=full_dates, y=curves["prior"].values, mode="lines",
+                                     name="Prior quarter", line={"color": "#94a3b8", "width": 2, "dash": "dot"}))
         fig.add_trace(go.Scatter(x=cum.index, y=cum.values, mode="lines", name="Actual (QTD)",
                                  line={"color": PRIMARY, "width": 3}, fill="tozeroy"))
+        # Run-rate forecast: extend today's pace to quarter-end (dashed).
+        cum_today = float(cum.iloc[-1]) if len(cum) else 0.0
+        fc_dates = full_dates[today_doq - 1:]
+        fc_y = [cum_today * (i + 1) / today_doq for i in range(today_doq - 1, day_in_q)]
+        fig.add_trace(go.Scatter(x=fc_dates, y=fc_y, mode="lines", name="Run-rate forecast",
+                                 line={"color": PRIMARY, "width": 2, "dash": "dash"}))
         if goal:
             total_days = (q_end - pacing["quarter_start"]).days or 1
             tgt_x = pd.date_range(qs_ts, pd.Timestamp(q_end))
             tgt_y = [goal * i / total_days for i in range(len(tgt_x))]
-            fig.add_trace(go.Scatter(x=tgt_x, y=tgt_y, mode="lines", name="Linear target",
-                                     line={"color": "#9ca3af", "dash": "dash"}))
-        fig.update_layout(title=f"{pace_metric}: cumulative QTD vs target", height=300,
-                          yaxis_title=ylab, margin=dict(t=40, b=10), legend={"orientation": "h"})
+            fig.add_trace(go.Scatter(x=tgt_x, y=tgt_y, mode="lines", name="Plan (linear)",
+                                     line={"color": "#16a34a", "dash": "dash"}))
+        fig.add_vline(x=pd.Timestamp(today), line_dash="dot", line_color="#cbd5e1")
+        fig.update_layout(title=f"{pace_metric}: QTD pace vs prior quarter, 4-qtr avg & forecast",
+                          height=320, yaxis_title=ylab, margin=dict(t=40, b=10),
+                          legend={"orientation": "h"})
         st.plotly_chart(fig, use_container_width=True)
-        if not goal:
-            st.caption("Add a goal in the sidebar to overlay the linear target line.")
+        proj = cum_today / (pace / 100) if pace else cum_today
+        proj_disp = money(proj) if metric_key in MONEY else f"{proj:,.0f}"
+        ref = ""
+        if curves.get("prior") is not None and len(curves["prior"]) >= today_doq:
+            prior_at_day = float(curves["prior"].iloc[today_doq - 1])
+            if prior_at_day:
+                ref = (f" That's **{(cum_today/prior_at_day - 1)*100:+.0f}%** vs the prior quarter at "
+                       f"the same day ({money(prior_at_day) if metric_key in MONEY else f'{prior_at_day:,.0f}'}).")
+        st.caption(f"Run-rate forecast ≈ **{proj_disp}** by quarter-end if today's pace holds." + ref +
+                   ("" if goal else " Add a goal in the sidebar to overlay the plan line."))
+
+        with st.expander("Funnel, conversion & run-rate detail", expanded=False):
+            won = int(base["is_book"].sum())
+            cc = st.columns([3, 2])
+            with cc[0]:
+                fig = go.Figure(go.Funnel(y=["SQL-Booked", "SQL-Held", "SAL", "Won"],
+                                x=[tot["sql_booked"], tot["sql_held"], tot["sal"], won],
+                                textinfo="value+percent initial", marker={"color": PRIMARY}))
+                fig.update_layout(title="Funnel (QTD)", height=300, margin=dict(t=40, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            with cc[1]:
+                st.markdown("**Run-rate projection (linear)**")
+                for m, lbl in [("sql_booked", "SQL-Booked"), ("bookings_arr", "Bookings ARR")]:
+                    proj2 = tot[m] / (pace / 100) if pace else tot[m]
+                    g = goal_sum(m)
+                    disp = money(proj2) if m in MONEY else f"{proj2:,.0f}"
+                    gd = money(g) if m in MONEY else f"{g:,.0f}"
+                    st.write(f"- **{lbl}:** projecting **{disp}** by quarter-end" + (f" vs {gd} plan" if g else ""))
+                st.markdown(f"- **Pipeline:** {money(tot['pipeline_arr'])} created · "
+                            f"{money(tot['pipeline_arr_sal'])} SAL-qualified")
+                st.caption("Linear pace = QTD ÷ % elapsed. SAL-qualified pipeline is the realistic "
+                           "'generated' figure; created runs high.")
+        how_to_read(["SQL-Booked", "SQL-Held", "SAL", "Created pipeline", "SAL-qualified pipeline",
+                     "Bookings ARR", "Bookings ACV", "ARR vs ACV", "QTD", "Quarter elapsed",
+                     "Pace vs prior quarter", "WoW"])
+
+    def s_weekly():
+        # Dedicated week-over-week view (Will): show the ACTUAL this-week vs last-week counts,
+        # not just a %. Weeks are Mon–Sun; current week is Mon→today.
+        wf = load_wow_funnel(today.isoformat())
+        this_start = today - dt.timedelta(days=today.weekday())
+        last_start = this_start - dt.timedelta(days=7)
+        last_end = this_start - dt.timedelta(days=1)
+        tw_lbl = f"This week ({this_start:%b %d}–{today:%b %d})"
+        lw_lbl = f"Last week ({last_start:%b %d}–{last_end:%b %d})"
+        rows_spec = [("SQL-Booked", "sql_booked", False), ("SQL-Held", "sql_held", False),
+                     ("SAL", "sal", False), ("Bookings ARR", "bookings_arr", True)]
+        tw_tot = {m: float(wf[f"{m}_tw"].sum()) for _, m, _ in rows_spec}
+        lw_tot = {m: float(wf[f"{m}_lw"].sum()) for _, m, _ in rows_spec}
+        _sb_chg = (tw_tot["sql_booked"] - lw_tot["sql_booked"])
+        decision_callout(
+            "Did this week speed up or slow down — and in which ERP?",
+            f"**{tw_tot['sql_booked']:,.0f}** SQL-Booked this week vs **{lw_tot['sql_booked']:,.0f}** last week "
+            f"({_sb_chg:+,.0f}). Volume alone hides the mix — the chart shows which ERP moved.",
+            ("Pull forward BDR/Channel activity — weekly creation is dropping."
+             if _sb_chg < 0 else "Weekly creation is holding/rising — protect what's working."))
+        cards = st.columns(len(rows_spec))
+        for i, (lbl, m, ismoney) in enumerate(rows_spec):
+            tw, lw = tw_tot[m], lw_tot[m]
+            d = tw - lw
+            disp = money(tw) if ismoney else f"{tw:,.0f}"
+            dd = money(d) if ismoney else f"{d:+,.0f}"
+            cards[i].metric(lbl + " (this wk)", disp,
+                            f"{dd} vs last wk" if not ismoney else f"{('+' if d>=0 else '')}{dd} vs last wk")
+        tbl = []
+        for lbl, m, ismoney in rows_spec:
+            tw, lw = tw_tot[m], lw_tot[m]
+            d = tw - lw
+            pct = (100 * d / lw) if lw else None
+            fmt = (lambda v: money(v)) if ismoney else (lambda v: f"{v:,.0f}")
+            tbl.append({"Metric": lbl, lw_lbl: fmt(lw), tw_lbl: fmt(tw),
+                        "Δ": (f"{'+' if d>=0 else ''}{fmt(d)}"),
+                        "Δ%": "—" if pct is None else f"{pct:+.0f}%"})
+        st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+        # SQL-Booked by ERP, this week vs last — the "80 SQLs but only 8 NetSuite" view.
+        wm = wf.set_index("market").reindex(MARKET_ORDER).fillna(0).reset_index()
+        melt = pd.DataFrame({
+            "Market": list(wm["market"]) * 2,
+            "Week": [lw_lbl] * len(wm) + [tw_lbl] * len(wm),
+            "SQL-Booked": list(wm["sql_booked_lw"]) + list(wm["sql_booked_tw"]),
+        })
+        fig = px.bar(melt, x="Market", y="SQL-Booked", color="Week", barmode="group",
+                     title="SQL-Booked by ERP — this week vs last", category_orders={"Market": MARKET_ORDER},
+                     color_discrete_sequence=["#cbd5e1", PRIMARY])
+        fig.update_layout(height=340, xaxis_title="", legend={"orientation": "h"})
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Weekly **flow** (events that happened in each week), not cumulative QTD. The split by ERP "
+                   "is the key check: a strong topline week can still be weak in the strategic markets.")
 
     def s_market():
         _mfi = market_funnel.set_index("market")
@@ -505,19 +670,21 @@ if meeting == "TOF Review":
             f"**{_lead}** leads bookings ({money(_mkt_book(_lead))}); **{_lag}** is the softest "
             f"strategic market ({money(_mkt_book(_lag))}).",
             f"Direct review time to {_lag}; confirm whether it's a pipeline-creation or conversion problem.")
-        st.caption("Format `value (WoW Δ, % to plan)`. A `–` means not-yet-available: **% to plan** needs a "
-                   "goal in the sidebar Goals editor; **WoW** needs a prior weekly snapshot (accruing from today — "
-                   "SQL-Booked already has live WoW). Strategic markets get the depth; the rest roll into Other (V2).")
+        st.caption("Quarter-to-date by strategic market; format `value (% to plan)` — a `–` means no goal is "
+                   "set yet (Goals editor in the sidebar). **Pipeline (created)** vs **Pipeline (SAL-qual.)** "
+                   "are shown side by side: created runs high; SAL-qualified is the realistic 'generated' figure. "
+                   "Week-over-week is on the Weekly Performance slide.")
         show = market_funnel.set_index("market").reindex(MARKET_ORDER).fillna(0).reset_index()
         rows = []
         for _, r in show.iterrows():
             mk = r["market"]
             rows.append({
                 "Market": mk,
-                "SQL-Booked": fmt_triple(r["sql_booked"], wow_pct(mk), attainment(mk, "sql_booked", r["sql_booked"])),
+                "SQL-Booked": fmt_triple(r["sql_booked"], None, attainment(mk, "sql_booked", r["sql_booked"])),
                 "SQL-Held": fmt_triple(r["sql_held"], None, attainment(mk, "sql_held", r["sql_held"])),
                 "SAL": fmt_triple(r["sal"], None, attainment(mk, "sal", r["sal"])),
-                "Pipeline ARR": fmt_triple(r["pipeline_arr"], None, attainment(mk, "pipeline_arr", r["pipeline_arr"]), money=True),
+                "Pipeline ARR (created)": money(r["pipeline_arr"]),
+                "Pipeline ARR (SAL-qual.)": money(r["pipeline_arr_sal"]),
                 "Bookings ARR": fmt_triple(r["bookings_arr"], None, attainment(mk, "bookings_arr", r["bookings_arr"]), money=True),
                 "Bookings ACV": money(r["bookings_acv"]),
             })
@@ -533,15 +700,29 @@ if meeting == "TOF Review":
             fig.update_layout(height=340, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
-            s2 = show.copy()
-            s2["att"] = s2["market"].map(lambda mk: attainment(mk, "bookings_arr",
-                        s2.loc[s2.market == mk, "bookings_arr"].iloc[0]) or 0)
-            fig = px.bar(s2, x="att", y="market", orientation="h", text=s2["att"].map(lambda v: f"{v:.0f}%"),
-                         title="Bookings ARR attainment by Market", category_orders={"market": MARKET_ORDER},
-                         color="market", color_discrete_map=MARKET_COLORS)
-            fig.add_vline(x=pace, line_dash="dash", annotation_text=f"pace {pace:.0f}%")
-            fig.update_layout(height=340, xaxis_title="% to plan", yaxis_title="", showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            if goal_sum("bookings_arr"):
+                s2 = show.copy()
+                s2["att"] = s2["market"].map(lambda mk: attainment(mk, "bookings_arr",
+                            s2.loc[s2.market == mk, "bookings_arr"].iloc[0]) or 0)
+                fig = px.bar(s2, x="att", y="market", orientation="h", text=s2["att"].map(lambda v: f"{v:.0f}%"),
+                             title="Bookings ARR attainment by Market", category_orders={"market": MARKET_ORDER},
+                             color="market", color_discrete_map=MARKET_COLORS)
+                fig.add_vline(x=pace, line_dash="dash", annotation_text=f"pace {pace:.0f}%")
+                fig.update_layout(height=340, xaxis_title="% to plan", yaxis_title="", showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                # Was reading as "broken" — it's just empty without goals. Show created vs SAL pipeline instead.
+                pm = show.melt(id_vars="market", value_vars=["pipeline_arr", "pipeline_arr_sal"],
+                               var_name="Type", value_name="ARR")
+                pm["Type"] = pm["Type"].map({"pipeline_arr": "Created", "pipeline_arr_sal": "SAL-qualified"})
+                pm["ARR $K"] = pm["ARR"] / 1e3
+                fig = px.bar(pm, x="market", y="ARR $K", color="Type", barmode="group",
+                             title="Pipeline ARR by Market — created vs SAL-qualified",
+                             category_orders={"market": MARKET_ORDER},
+                             color_discrete_sequence=["#cbd5e1", PRIMARY])
+                fig.update_layout(height=340, xaxis_title="", legend={"orientation": "h"})
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Set Bookings ARR goals in the sidebar to switch this to an attainment-vs-pace chart.")
 
     def s_gtm():
         _gi = gtm.set_index("gtm")
@@ -583,31 +764,59 @@ if meeting == "TOF Review":
         gtm_disp.columns = ["GTM Engine", "SQL-Booked", "SQL-Held", "SAL", "Held %", "SAL %"]
         st.dataframe(gtm_disp, use_container_width=True, hide_index=True)
 
+        # GTM × ERP matrix (Will: stop conflating volume with strategic-market production —
+        # show which engine actually creates NetSuite/Sage/Dynamics SQLs).
+        st.markdown("**Engine × ERP — SQL-Booked (QTD)**")
+        gxm = (base[base["is_sql"]].groupby(["gtm", "market"]).size()
+               .unstack(fill_value=0).reindex(index=GTM_ENGINES, columns=MARKET_ORDER, fill_value=0))
+        fig = px.imshow(gxm, text_auto=True, aspect="auto", color_continuous_scale="Blues",
+                        title="Which engine produces which ERP's SQLs")
+        fig.update_layout(height=300, xaxis_title="", yaxis_title="", coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("A high-volume engine that's light on NetSuite / Sage / Dynamics isn't producing "
+                   "the leads that convert to revenue — that's the gap to call out in the room.")
+
     def s_product():
         prod = analytics.dim_funnel(base, "product").rename(columns={"dim": "product"})
+        _pi = prod.set_index("product")
+        _ap_book = float(_pi.loc["AP", "bookings_acv"]) if "AP" in _pi.index else 0.0
+        _ap_pipe = float(_pi.loc["AP", "pipeline_acv"]) if "AP" in _pi.index else 0.0
+        _lead_p = prod.loc[prod["bookings_acv"].idxmax(), "product"] if not prod["bookings_acv"].empty else "—"
+        matrix = analytics.product_market_matrix(base, "bookings_acv")
+        _cell, _cell_val = None, 0.0
+        if not matrix.empty:
+            matrix = matrix.reindex(columns=[m for m in MARKET_ORDER if m in matrix.columns])
+            _flat = matrix.stack()
+            if not _flat.empty:
+                _cell, _cell_val = _flat.idxmax(), float(_flat.max())
+        _cell_txt = (f" Strongest product × market cell: **{_cell[0]} × {_cell[1]}** "
+                     f"({money(_cell_val)} bookings ACV)." if _cell else "")
+        decision_callout(
+            "Which products — and product × market combos — are actually producing bookings?",
+            f"**{_lead_p}** leads bookings ACV; AP carries {money(_ap_pipe)} pipeline and "
+            f"{money(_ap_book)} bookings (QTD)." + _cell_txt,
+            "Double down where a product and a strategic market already convert together; if AP "
+            "pipeline isn't converting, inspect AP deal quality before adding AP demand.")
         c1, c2 = st.columns(2)
         with c1:
             fig = px.pie(prod, names="product", values="pipeline_acv", hole=0.5,
                          title="Pipeline ACV mix by Product (QTD)")
-            fig.update_layout(height=340)
+            fig.update_layout(height=320)
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             p2 = prod.copy(); p2["Bookings $K"] = p2["bookings_acv"] / 1e3
             fig = px.bar(p2.sort_values("Bookings $K"), x="Bookings $K", y="product", orientation="h",
                          title="Bookings ACV by Product ($K)", text_auto=".0f", color="product")
-            fig.update_layout(height=340, showlegend=False)
+            fig.update_layout(height=320, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
-
-    def s_pxm():
-        matrix = analytics.product_market_matrix(base, "bookings_acv")
+        st.markdown("**Where does each product actually convert? (Product × Market, bookings ACV)**")
         if not matrix.empty:
-            matrix = matrix.reindex(columns=[m for m in MARKET_ORDER if m in matrix.columns])
             fig = px.imshow(matrix, text_auto=".2s", aspect="auto", color_continuous_scale="Blues",
                             title="Bookings ACV: Product (rows) × Market (cols)")
-            fig.update_layout(height=320)
+            fig.update_layout(height=300)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.caption("No closed-won bookings yet this quarter to populate the matrix.")
+            st.caption("No closed-won bookings yet this quarter to populate the product × market matrix.")
 
     def s_strategic():
         strategic_priorities("TOF")
@@ -657,17 +866,18 @@ if meeting == "TOF Review":
                      use_container_width=True, hide_index=True)
 
     SLIDES = [
-        {"id": "title", "title": "Top of Funnel Review", "sub": "", "render": s_title},
         {"id": "exec", "title": "Executive Summary", "hs": "pipeline",
-         "sub": "Are we creating enough future revenue, and are we on pace?", "render": s_exec},
+         "sub": "Will we create enough future revenue? Quarter-to-date health, pace and forecast.",
+         "render": s_exec},
+        {"id": "weekly", "title": "Weekly Performance", "hs": "funnel",
+         "sub": "What happened this week vs last week — by volume and by ERP.", "render": s_weekly},
         {"id": "market", "title": "Market Performance", "hs": "funnel",
          "sub": "Where growth is coming from — and where it's slowing.", "render": s_market},
         {"id": "gtm", "title": "GTM Engine", "hs": "marketing",
          "sub": "Which acquisition engine produces repeatable pipeline.", "render": s_gtm},
-        {"id": "product", "title": "Product", "hs": "pipeline",
-         "sub": "AR / AP / Multi-product mix across pipeline and bookings.", "render": s_product},
-        {"id": "pxm", "title": "Product × Market", "hs": "pipeline",
-         "sub": "Where product and market intersect on bookings.", "render": s_pxm},
+        {"id": "product", "title": "Product & Product × Market", "hs": "pipeline",
+         "sub": "AR / AP / Multi-product mix, and where each product converts by market.",
+         "render": s_product},
         {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
          "sub": "The six weekly questions, answered with data.", "render": s_strategic},
         {"id": "trends", "title": "Trends", "hs": "waterfall",
@@ -701,21 +911,21 @@ else:
     cov_word = ("no goal set" if coverage is None else
                 ("healthy (≥3×)" if coverage >= 3 else "thin (<3×)"))
 
-    def s_title():
-        st.markdown(f"<div class='hero-q'>{core_q}</div>", unsafe_allow_html=True)
-        c = st.columns(4)
-        c[0].metric("Commit (Q)", money(commit), help=help_for("Commit"))
-        c[1].metric("Commit + Best", money(commit + best), help=help_for("Commit", "Best Case"))
-        c[2].metric("Pipeline coverage", "—" if coverage is None else f"{coverage:.1f}×",
-                    help=help_for("Pipeline coverage"))
-        c[3].metric("Bookings QTD (ARR)", money(bookings_arr_qtd), help=help_for("Bookings ARR", "QTD"))
-        st.markdown(pacing_line())
-        st.caption(f"Updated {pacing['today']:%A, %b %d %Y} · hover any ⓘ for a definition · "
-                   "use ◀ / ▶ above to move through the deck.")
-        how_to_read(["Commit", "Best Case", "Pipeline coverage", "Weighted", "Forecast discipline",
-                     "Bookings ARR", "ARR vs ACV", "RAG", "MEDDPICC", "Quarter elapsed"])
-
     def s_exec():
+        # Slide 1 = forecast health in one frame (V2: "understand forecast health within the first
+        # few minutes"). North-star strip, the W/M/Q forecast, then the decision. Gauges → expander.
+        n = st.columns(4)
+        n[0].metric("Commit (Q)", money(commit), f"{q_att:.0f}% to plan" if q_att is not None else None,
+                    delta_color="off", help=help_for("Commit"))
+        n[1].metric("Commit + Best", money(commit + best),
+                    f"{100*(commit+best)/plan:.0f}% to plan" if plan else None, delta_color="off",
+                    help=help_for("Commit", "Best Case"))
+        n[2].metric("Pipeline coverage", "—" if coverage is None else f"{coverage:.1f}×",
+                    cov_word, delta_color="off", help=help_for("Pipeline coverage"))
+        n[3].metric("Bookings QTD (ARR)", money(bookings_arr_qtd),
+                    f"{100*bookings_arr_qtd/plan:.0f}% to plan" if plan else None, delta_color="off",
+                    help=help_for("Bookings ARR", "QTD"))
+        st.caption(pacing_line())
         decision_callout(
             "Will we hit the number?",
             f"Commit {money(commit)}"
@@ -728,6 +938,8 @@ else:
         st.caption("Forecast categories come straight from HubSpot `hs_manual_forecast_category` (rep's call = "
                    "source of truth). Open pipeline = deals beyond SQL stage still open. Each horizon = deals "
                    "expected to close by that date.")
+
+        st.markdown("**Forecast by horizon**")
         cols = st.columns(3)
         for i, name in enumerate(["Week", "Month", "Quarter"]):
             w = win[name]
@@ -735,40 +947,63 @@ else:
             with cols[i]:
                 st.markdown(f"**{name}** · by {w['end']:%b %d}")
                 st.metric("Commit", money(w["commit"]), f"{w['deals']} deals ≤ horizon",
-                          help=help_for("Commit"))
+                          delta_color="off", help=help_for("Commit"))
                 st.caption(f"+ Best Case {money(w['best'])} · Total open {money(w['total'])}"
                            + (f" · Commit {att:.0f}% of plan" if att else ""))
-        g = st.columns(4)
-        for i, (lbl, val, ref) in enumerate([
-                ("Commit (Q)", commit, plan or commit * 1.5),
-                ("Commit + Best", commit + best, plan or (commit + best) * 1.3),
-                ("Weighted (illustrative)", weighted, plan or weighted * 1.3),
-                ("Total open (Q)", win["Quarter"]["total"], plan or win["Quarter"]["total"])]):
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number", value=val, number={"prefix": "$", "valueformat": ".2s"},
-                title={"text": lbl, "font": {"size": 12}},
-                gauge={"axis": {"range": [0, max(ref, val) * 1.1]}, "bar": {"color": PRIMARY},
-                       "threshold": {"line": {"color": "red", "width": 3}, "value": ref}}))
-            fig.update_layout(height=190, margin=dict(t=36, b=8, l=18, r=18))
-            g[i].plotly_chart(fig, use_container_width=True)
-        st.caption(f"Red line = Bookings ARR plan ({money(plan) if plan else 'set in sidebar'}). "
-                   "Weighted = Σ (ACV × HubSpot deal-stage probability) — HubSpot's own numbers, not invented weights.")
 
-        k = st.columns(3)
-        k[0].metric("Pipeline coverage", "—" if coverage is None else f"{coverage:.1f}×",
-                    cov_word, delta_color="off", help=help_for("Pipeline coverage"))
-        k[0].caption(f"Open pipeline {money(open_arr)} ÷ {money(gap)} gap to plan. Benchmark ≥ 3×.")
         disc_pct = 100 * categorized / len(df) if len(df) else 0
         disc_status = "Green" if disc_pct >= 70 else ("Yellow" if disc_pct >= 40 else "Red")
-        k[1].metric("Forecast discipline", f"{categorized}/{len(df)} categorized",
-                    f"{commit_best_ct} Commit/Best", delta_color="off",
-                    help=help_for("Forecast discipline"))
-        k[1].caption(f"{money(uncat_acv)} ACV sits in OMIT/uncategorized — not a forecast call. "
-                     f"({disc_status} hygiene)")
-        k[2].metric("Bookings QTD (ARR)", money(bookings_arr_qtd),
-                    f"{100*bookings_arr_qtd/plan:.0f}% of plan" if plan else None, delta_color="off",
-                    help=help_for("Bookings ARR", "QTD"))
-        k[2].caption("Closed-won ARR booked so far this quarter.")
+        ahead_ct = int(df["cat_ahead_of_stage"].sum())
+        ahead_acv = float(df.loc[df["cat_ahead_of_stage"], "acv"].sum())
+        st.markdown(f"**Forecast discipline:** {categorized}/{len(df)} open deals categorized "
+                    f"({commit_best_ct} Commit/Best) · {money(uncat_acv)} ACV uncategorized · "
+                    f"**{disc_status}** hygiene. &nbsp; **Coverage:** open pipeline {money(open_arr)} ÷ "
+                    f"{money(gap)} gap to plan (benchmark ≥ 3×).")
+        if ahead_ct:
+            st.markdown(f"<span style='color:#b45309'>⚠ <b>{ahead_ct}</b> deal(s) "
+                        f"({money(ahead_acv)} ACV) have a forecast category <b>ahead of their stage</b> "
+                        f"(e.g. Commit before Negotiation) — flagged on the Deal Watchlist.</span>",
+                        unsafe_allow_html=True)
+
+        with st.expander("Forecast detail — gauges vs plan & how it's computed", expanded=False):
+            g = st.columns(4)
+            for i, (lbl, val, ref) in enumerate([
+                    ("Commit (Q)", commit, plan or commit * 1.5),
+                    ("Commit + Best", commit + best, plan or (commit + best) * 1.3),
+                    ("Weighted (illustrative)", weighted, plan or weighted * 1.3),
+                    ("Total open (Q)", win["Quarter"]["total"], plan or win["Quarter"]["total"])]):
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number", value=val, number={"prefix": "$", "valueformat": ".2s"},
+                    title={"text": lbl, "font": {"size": 12}},
+                    gauge={"axis": {"range": [0, max(ref, val) * 1.1]}, "bar": {"color": PRIMARY},
+                           "threshold": {"line": {"color": "red", "width": 3}, "value": ref}}))
+                fig.update_layout(height=190, margin=dict(t=36, b=8, l=18, r=18))
+                g[i].plotly_chart(fig, use_container_width=True)
+            st.caption(f"Red line = Bookings ARR plan ({money(plan) if plan else 'set in sidebar'}). "
+                       "Weighted = Σ (Deal ACV × stage probability) per the AE Forecast-Hygiene standard.")
+            st.markdown("**Deal probability by stage (AE Forecast-Hygiene standard)** — system-assigned by "
+                        "stage, not entered by reps:")
+            st.dataframe(pd.DataFrame([
+                {"Deal stage": "SQL", "Probability": "6%", "Allowed forecast category": "Not Forecasted"},
+                {"Deal stage": "SAL – Discovery / Demo", "Probability": "15%",
+                 "Allowed forecast category": "Not Forecasted or Pipeline"},
+                {"Deal stage": "OPP – Proposal / ROI", "Probability": "45%",
+                 "Allowed forecast category": "Pipeline or Best Case"},
+                {"Deal stage": "OPP – Negotiation / Decision", "Probability": "70%",
+                 "Allowed forecast category": "Best Case or Commit"},
+                {"Deal stage": "Closed Won", "Probability": "100%", "Allowed forecast category": "Closed Won"},
+            ]), use_container_width=True, hide_index=True)
+            st.markdown(
+                "- **Weighted** = Σ (Deal ACV × stage probability above) — the documented hygiene formula.\n"
+                "- **Commit** = Σ ACV where the rep's HubSpot category = `COMMIT` (only valid at Negotiation).\n"
+                "- **Best Case** = Σ ACV where category = `BEST_CASE` (valid at Proposal/Negotiation).\n"
+                "- **Week / Month / Quarter** = the above, restricted to deals with `closedate` ≤ horizon end.\n"
+                "- **Pipeline coverage** = open pipeline ARR ÷ remaining gap to plan.\n"
+                "- The watchlist flags **'Category ahead of stage'** when a rep's category is more optimistic "
+                "than the stage allows (e.g. Commit at Proposal), and recommends aligning it.\n\n"
+                "*Confirm with Marcelo: Commit in ACV or ARR? Horizon on `closedate` or a forecast date?*")
+        how_to_read(["Commit", "Best Case", "Pipeline coverage", "Weighted", "Forecast discipline",
+                     "Bookings ARR", "ARR vs ACV", "RAG", "MEDDPICC", "Quarter elapsed"])
 
     def s_movement():
         pd_date, prior = snapshots.prior_week(today)
@@ -818,11 +1053,25 @@ else:
             st.dataframe(t, use_container_width=True, hide_index=True)
 
     def s_product():
+        _pr = df.groupby("product")["acv"].sum()
+        _topp = _pr.idxmax() if not _pr.empty else "—"
+        _ap = float(_pr.get("AP", 0.0))
+        pm_matrix = df.pivot_table(index="product", columns="market", values="acv", aggfunc="sum", fill_value=0)
+        pm_matrix = pm_matrix.reindex(columns=[m for m in MARKET_ORDER if m in pm_matrix.columns])
+        _flat = pm_matrix.stack()
+        _cell = _flat.idxmax() if not _flat.empty else None
+        _cell_txt = (f" Biggest product × market cell: **{_cell[0]} × {_cell[1]}** "
+                     f"({money(float(_flat.max()))} open ACV)." if _cell else "")
+        decision_callout(
+            "Where does open forecast sit by product — and which product × market combo carries it?",
+            f"**{_topp}** holds the most open ACV; AP carries {money(_ap)} open." + _cell_txt,
+            "If AP is heavy on Pipeline but light on Commit, qualify AP deals harder before counting "
+            "them; make sure the biggest cell isn't single-deal dependent.")
         c1, c2 = st.columns(2)
         with c1:
             pr = df.groupby("product").agg(acv=("acv", "sum")).reset_index()
             fig = px.pie(pr, names="product", values="acv", hole=0.5, title="Open ACV by Product")
-            fig.update_layout(height=320)
+            fig.update_layout(height=300)
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             ps = df.groupby("product").apply(lambda x: pd.Series({
@@ -832,22 +1081,28 @@ else:
             pm = ps.melt(id_vars="product", var_name="Category", value_name="ACV")
             fig = px.bar(pm, x="product", y="ACV", color="Category",
                          title="Open ACV by Product × Forecast category", color_discrete_map=FCAT_COLORS)
-            fig.update_layout(height=320, xaxis_title="")
+            fig.update_layout(height=300, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
+        st.markdown("**Where does open ACV concentrate across product and market?**")
+        if not _flat.empty:
+            fig = px.imshow(pm_matrix, text_auto=".2s", aspect="auto", color_continuous_scale="Blues",
+                            title="Open pipeline ACV: Product (rows) × Market (cols)")
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No open pipeline to map across product × market yet.")
 
     def s_gtm():
         gv = df.groupby("gtm").agg(ACV=("acv", "sum"), Deals=("deal_id", "count")).reset_index()
+        _topg = gv.loc[gv["ACV"].idxmax(), "gtm"] if not gv["ACV"].empty else "—"
+        _ch = float(gv.loc[gv["gtm"] == "Channels", "ACV"].sum())
+        decision_callout(
+            "Which engine's deals are carrying the open forecast?",
+            f"**{_topg}** holds the most open ACV; Channel carries {money(_ch)} (our top growth lever per V2).",
+            "Concentrate forecast inspection where the open ACV sits; if Channel is thin, escalate partner pipeline.")
         fig = px.bar(gv.sort_values("ACV"), x="ACV", y="gtm", orientation="h", text_auto=".2s",
                      color="gtm", title="Open pipeline ACV by GTM Engine")
         fig.update_layout(height=300, showlegend=False, yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-    def s_pxm():
-        pm_matrix = df.pivot_table(index="product", columns="market", values="acv", aggfunc="sum", fill_value=0)
-        pm_matrix = pm_matrix.reindex(columns=[m for m in MARKET_ORDER if m in pm_matrix.columns])
-        fig = px.imshow(pm_matrix, text_auto=".2s", aspect="auto", color_continuous_scale="Blues",
-                        title="Open pipeline ACV: Product × Market")
-        fig.update_layout(height=300)
         st.plotly_chart(fig, use_container_width=True)
 
     def s_strategic():
@@ -886,10 +1141,9 @@ else:
         st.dataframe(wl, use_container_width=True, hide_index=True,
                      column_config={"HubSpot": st.column_config.LinkColumn("HubSpot", display_text="open ↗")})
         gong_cov = df["gong_sentiment"].notna().sum()
-        st.caption(f"HubSpot links use portal id `{PORTAL_ID}` (placeholder — set PORTAL_ID to activate). "
-                   f"**Gong sentiment** shown where deal-linked ({gong_cov}/{len(df)} open deals; "
-                   "linkage is partial — see audit). Recommended category is rule-based; the Gong-grounded "
-                   "agent will add buyer-evidence rationale.")
+        st.caption(f"HubSpot links open the deal in portal `{PORTAL_ID}`. **Gong sentiment** is shown where "
+                   f"the deal is Gong-linked ({gong_cov}/{len(df)} open deals; linkage is partial). "
+                   "Recommended category is rule-based, from forecast-hygiene + MEDDPICC + activity risk.")
 
     def s_actions():
         actions_section("Booking")
@@ -934,19 +1188,18 @@ else:
         st.dataframe(df[cc].sort_values("acv", ascending=False), use_container_width=True, hide_index=True)
 
     SLIDES = [
-        {"id": "title", "title": "Booking / Deals Review", "sub": "", "render": s_title},
         {"id": "exec", "title": "Executive Forecast", "hs": "pods",
-         "sub": "Will we hit the number? Week / Month / Quarter view.", "render": s_exec},
+         "sub": "Will we hit the number? Week / Month / Quarter forecast, coverage and discipline.",
+         "render": s_exec},
         {"id": "movement", "title": "Forecast Movement", "hs": "waterfall",
          "sub": "What changed in the forecast week-over-week.", "render": s_movement},
         {"id": "market", "title": "Market Forecast View", "hs": "funnel",
          "sub": "Which markets carry the forecast — and the risk.", "render": s_market},
-        {"id": "product", "title": "Product Forecast View", "hs": "pipeline",
-         "sub": "Open ACV by product and forecast category.", "render": s_product},
+        {"id": "product", "title": "Product & Product × Market", "hs": "pipeline",
+         "sub": "Open ACV by product and forecast category, and where it concentrates by market.",
+         "render": s_product},
         {"id": "gtm", "title": "GTM Engine View", "hs": "sdr",
          "sub": "Open pipeline ACV by acquisition engine.", "render": s_gtm},
-        {"id": "pxm", "title": "Product × Market View", "hs": "pipeline",
-         "sub": "Where open ACV concentrates across product and market.", "render": s_pxm},
         {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
          "sub": "The six weekly questions, answered with data.", "render": s_strategic},
         {"id": "pods", "title": "Pod Reviews", "hs": "pods",
@@ -1025,5 +1278,5 @@ else:
     drill_extras()
 
 st.divider()
-st.caption("AI brain (ask-anything, grounded in BigQuery + Gong) docks here once the LLM runtime is set. "
-           "RAG / MEDDPICC / forecast-category / pod logic already runs deterministically from the boss's specs.")
+st.caption("Forecast category, deal-stage probability, MEDDPICC, RAG and pod logic run deterministically "
+           "from HubSpot data and the documented forecast-hygiene standard.")

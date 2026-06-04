@@ -104,6 +104,15 @@ GLOSSARY = {
     "SAL": "Sales-Accepted Leads: deals AEs accepted as real opportunities (sal_date in period).",
     "Pipeline ARR": "Annual Recurring Revenue of deals created in the period (new pipeline $).",
     "Pipeline ACV": "Annual Contract Value (AR + AP) of deals created in the period.",
+    "Created pipeline": "ARR/ACV of every deal CREATED in the period (by HubSpot createdate). "
+                        "Broadest measure — includes deals not yet qualified, so it runs high.",
+    "SAL-qualified pipeline": "ARR/ACV of deals that reached SAL (became accepted opportunities, "
+                              "by sal_date) in the period. The realistic 'pipeline generated' "
+                              "figure — 'everything from SAL and onward is pipeline.'",
+    "Run-rate forecast": "A simple projection of where a metric lands at quarter-end if the "
+                         "current pace holds: QTD ÷ % of quarter elapsed.",
+    "Pace vs prior quarter": "How this quarter's cumulative pace compares to where we were at the "
+                             "same day of the previous quarter (and the trailing-4-quarter average).",
     "Bookings ARR": "ARR of deals Closed-Won in the period — revenue actually booked.",
     "Bookings ACV": "Annual Contract Value (AR + AP) of deals Closed-Won in the period.",
     "ARR vs ACV": "ARR = recurring software revenue. ACV = total annual contract value "
@@ -114,8 +123,12 @@ GLOSSARY = {
     "Best Case": "Upside deals that could close with effort (HubSpot forecast category = Best Case).",
     "Pipeline coverage": "Open pipeline ARR ÷ remaining gap to plan. Benchmark ≥ 3× — i.e. you "
                          "typically need 3x the gap in open pipeline to cover normal loss rates.",
-    "Weighted": "Σ (deal ACV × HubSpot deal-stage probability). A probability-adjusted forecast "
-                "using HubSpot's own stage odds — not invented weights.",
+    "Weighted": "Σ (deal ACV × stage probability) per the AE Forecast-Hygiene standard: "
+                "SQL 6%, SAL/Discovery 15%, Proposal/ROI 45%, Negotiation 70%, Closed Won 100%. "
+                "Probability is system-assigned by stage, not entered by reps.",
+    "Category ahead of stage": "A hygiene flag: the rep's forecast category is more optimistic than "
+                               "the deal stage allows (e.g. Commit at Proposal). Per the standard, Commit "
+                               "is only valid at Negotiation, Best Case at Proposal+, Pipeline at SAL+.",
     "Forecast discipline": "Share of open deals that carry a rep forecast category. Low = reps "
                            "aren't calling their deals, so the forecast is less trustworthy.",
     "RAG": "Red / Amber / Green health rating from risk flags + MEDDPICC completeness + pace.",

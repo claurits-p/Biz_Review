@@ -1,8 +1,7 @@
 """Per-slide qualitative notes ("Talking points / commentary") store.
 
 This is the qualitative layer of the deck — typed context that shows on each slide and
-persists per quarter + meeting + slide. Today it's manual (local JSON); later the boss's
-Gong+HubSpot agent can auto-write these. v0 = local JSON; move to BigQuery on deploy.
+persists per quarter + meeting + slide. v0 = local JSON; move to BigQuery on deploy.
 """
 import json
 import os

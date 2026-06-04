@@ -13,6 +13,11 @@ from definitions import market_bucket, product_bucket, gtm_bucket, FORECAST_CATE
 
 FUNNEL_METRICS = ["sql_booked", "sql_held", "sal", "pipeline_arr", "pipeline_acv",
                   "bookings_arr", "bookings_acv"]
+# SAL-qualified pipeline = $ of deals that reached SAL (became accepted opportunities) in the
+# period. Per Will: "everything from SAL and onward is pipeline." This is the realistic
+# 'generated pipeline' figure; the create-date version (pipeline_arr/acv) overcounts because it
+# includes everything ever created, pre-qualification.
+SAL_PIPELINE_METRICS = ["pipeline_arr_sal", "pipeline_acv_sal"]
 
 
 def _eco_label(e: str) -> str:
@@ -55,8 +60,12 @@ def dim_funnel(df: pd.DataFrame, dim: str) -> pd.DataFrame:
         "sql_booked": int(x["is_sql"].sum()),
         "sql_held": int(x["is_held"].sum()),
         "sal": int(x["is_sal"].sum()),
+        # Created pipeline (by createdate) — every deal created in the period.
         "pipeline_arr": float(x.loc[x["is_sql"], "arr"].sum()),
         "pipeline_acv": float(x.loc[x["is_sql"], "acv"].sum()),
+        # SAL-qualified pipeline (by sal_date) — only deals that became accepted opportunities.
+        "pipeline_arr_sal": float(x.loc[x["is_sal"], "arr"].sum()),
+        "pipeline_acv_sal": float(x.loc[x["is_sal"], "acv"].sum()),
         "bookings_arr": float(x.loc[x["is_book"], "arr"].sum()),
         "bookings_acv": float(x.loc[x["is_book"], "acv"].sum()),
     })).reset_index().rename(columns={dim: "dim"})
@@ -85,6 +94,27 @@ OPEN_STAGE_IDS = ["9e0025bf-6ac8-4ea3-8be0-72670975ba17",
                   "cef195c9-8378-451e-bad0-2ed3826dbf30",
                   "826cdb91-de03-4bee-a009-1f9aeb058d10"]
 STALE_DAYS = 14
+
+# AE Forecast-Hygiene standard (source of truth). Deal probability is STAGE-DRIVEN — system-assigned
+# by stage, not entered by reps — and each stage permits only certain forecast categories.
+#   SQL 6% (Not Forecasted) · SAL/Discovery 15% (Not Forecasted/Pipeline) ·
+#   Proposal/ROI 45% (Pipeline/Best Case) · Negotiation 70% (Best Case/Commit) · Closed Won 100%.
+# Weighted Forecast Amount = Deal Amount × stage probability.
+STAGE_PROBABILITY = {
+    "SQL": 0.06,
+    "SAL – Discovery/Demo": 0.15,
+    "OPP – Proposal/ROI": 0.45,
+    "OPP – Negotiation": 0.70,
+}
+# Most optimistic forecast category each stage may legitimately carry (anything beyond = "ahead of stage").
+_CAT_RANK = {"Not Forecasted": 0, "Pipeline": 1, "Best Case": 2, "Commit": 3}
+STAGE_MAX_CATEGORY = {
+    "SQL": "Not Forecasted",
+    "SAL – Discovery/Demo": "Pipeline",
+    "OPP – Proposal/ROI": "Best Case",
+    "OPP – Negotiation": "Commit",
+}
+STAGE_MAX_RANK = {s: _CAT_RANK[c] for s, c in STAGE_MAX_CATEGORY.items()}
 
 
 def _yes(v) -> bool:
@@ -187,11 +217,18 @@ def open_pipeline(today: dt.date) -> pd.DataFrame:
     df["is_forecasted"] = df["fcat"].isin(["COMMIT", "BEST_CASE", "PIPELINE"])
     df["fcat_disp"] = df["fcat"].map(lambda x: "Uncategorized" if (x is None or str(x).strip() == "")
                                      else FORECAST_CATEGORY_MAP.get(x, str(x).title()))
-    # Real weighted forecast from HubSpot's own stage probability (no invented weights).
-    prob = pd.to_numeric(df["prob"], errors="coerce").fillna(0.0)
-    prob = prob.where(prob <= 1.0, prob / 100.0)  # handle 0-100 vs 0-1 encodings
-    df["prob"] = prob
-    df["weighted_acv"] = df["acv"] * prob
+    # Weighted forecast uses the STAGE-driven probability from the AE Forecast-Hygiene standard
+    # (system-assigned by stage): SQL 6% · SAL 15% · Proposal 45% · Negotiation 70%. HubSpot's raw
+    # stage-probability field is kept as `hs_prob` for reconciliation.
+    df["stage_prob"] = df["stage"].map(STAGE_PROBABILITY).fillna(0.0)
+    hs_prob = pd.to_numeric(df["prob"], errors="coerce").fillna(0.0)
+    df["hs_prob"] = hs_prob.where(hs_prob <= 1.0, hs_prob / 100.0)
+    df["prob"] = df["stage_prob"]
+    df["weighted_acv"] = df["acv"] * df["stage_prob"]
+    # Hygiene: is the rep's forecast category more optimistic than the stage allows?
+    df["cat_ahead_of_stage"] = df.apply(
+        lambda r: _CAT_RANK.get(r.forecast_cat, 0) > STAGE_MAX_RANK.get(r.stage, 3), axis=1)
+    df["stage_max_cat"] = df["stage"].map(STAGE_MAX_CATEGORY).fillna("Commit")
     df["owner_name"] = df["owner_id"].map(lambda x: om.get(x, ("Unassigned", "Unassigned"))[0])
     df["pod"] = df["owner_id"].map(lambda x: om.get(x, ("Unassigned", "Unassigned"))[1])
     df["days_since_contact"] = df["last_contact_d"].map(
@@ -221,6 +258,8 @@ def open_pipeline(today: dt.date) -> pd.DataFrame:
             out.append("No economic buyer")
         if r.stage in ("OPP – Proposal/ROI", "OPP – Negotiation") and r.meddpicc < 3:
             out.append("Late stage, weak MEDDPICC")
+        if r.cat_ahead_of_stage:
+            out.append("Category ahead of stage")
         return out
     df["risk_flags"] = df.apply(risks, axis=1)
     df["risk_count"] = df["risk_flags"].map(len)
@@ -261,6 +300,9 @@ def recommended_category(r) -> str:
     The rep's HubSpot category is the source of truth; this is the evidence-based challenge.
     (Gong + LLM will deepen the rationale later.)"""
     cur = r.forecast_cat
+    # Category ahead of stage is the clearest, most-documented hygiene violation — align it first.
+    if getattr(r, "cat_ahead_of_stage", False):
+        return f"Downgrade → {r.stage_max_cat} (stage cap)"
     if cur == "Commit" and (r.rag == "Red" or r.meddpicc < 3 or "No activity 14d+" in r.risk_flags):
         return "Downgrade → Best Case"
     if cur == "Best Case" and r.rag == "Red":
@@ -277,6 +319,8 @@ def recommended_category(r) -> str:
 def recommended_reason(r) -> str:
     """One-line evidence rationale for the recommendation (HubSpot + MEDDPICC facts)."""
     bits = []
+    if getattr(r, "cat_ahead_of_stage", False):
+        bits.append(f"{r.forecast_cat} at {r.stage} (cap {r.stage_max_cat})")
     if r.meddpicc < 3:
         bits.append(f"MEDDPICC {r.meddpicc}/5")
     if "No activity 14d+" in r.risk_flags:
@@ -293,6 +337,7 @@ def recommended_reason(r) -> str:
 
 
 _ACTIONS = {
+    "Category ahead of stage": "Align forecast category to deal stage",
     "No activity 14d+": "Re-engage — book next touch this week",
     "Single-threaded": "Multi-thread — add a 2nd+ stakeholder",
     "No next step": "Set a concrete next step + date",
@@ -302,8 +347,8 @@ _ACTIONS = {
 
 
 def recommended_action(flags) -> str:
-    for f in ["No activity 14d+", "No economic buyer", "Late stage, weak MEDDPICC",
-              "Single-threaded", "No next step"]:
+    for f in ["Category ahead of stage", "No activity 14d+", "No economic buyer",
+              "Late stage, weak MEDDPICC", "Single-threaded", "No next step"]:
         if f in flags:
             return _ACTIONS[f]
     return "On track — maintain cadence"
@@ -448,6 +493,42 @@ def historical_snapshots(base: pd.DataFrame, quarter_start, today) -> dict:
         }
         fri += pd.Timedelta(days=7)
     return out
+
+
+def _q_start_of(dte: dt.date) -> dt.date:
+    qq = (dte.month - 1) // 3
+    return dt.date(dte.year, qq * 3 + 1, 1)
+
+
+def quarter_pace_curves(hist: pd.DataFrame, metric: str, today: dt.date,
+                        days_in_quarter: int) -> dict:
+    """Turn daily flow history into cumulative-by-day-of-quarter pace curves so the deck can
+    answer 'are we tracking?' — prior quarter and trailing-4-quarter average, aligned to the
+    same day index and extended across the full quarter length.
+
+    metric ∈ {'sql_booked', 'bookings_arr'}. Returns {'prior': Series, 'avg4': Series} indexed
+    0..days_in_quarter-1 (cumulative, forward-filled). Missing inputs -> empty dict entries.
+    """
+    if hist is None or hist.empty or metric not in hist.columns:
+        return {"prior": None, "avg4": None}
+    df = hist.copy()
+    df["q_start"] = df["d_date"].apply(lambda x: _q_start_of(x.date()))
+    df["doq"] = df.apply(lambda r: (r["d_date"].date() - r["q_start"]).days, axis=1)
+    cur_qs = _q_start_of(today)
+    full_idx = range(days_in_quarter)
+
+    def _cum(g):
+        s = g.groupby("doq")[metric].sum().sort_index().cumsum()
+        return s.reindex(full_idx).ffill().fillna(0.0)
+
+    completed = {qs: _cum(g) for qs, g in df.groupby("q_start") if qs < cur_qs}
+    if not completed:
+        return {"prior": None, "avg4": None}
+    ordered = sorted(completed)
+    prior = completed[ordered[-1]]
+    last4 = [completed[qs] for qs in ordered[-4:]]
+    avg4 = pd.concat(last4, axis=1).mean(axis=1)
+    return {"prior": prior, "avg4": avg4}
 
 
 def money_short(v) -> str:
