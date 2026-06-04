@@ -17,11 +17,20 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 
-# Unify Plotly chart fonts with the Streamlit UI font (Source Sans Pro) so everything matches.
+# Unify Plotly chart fonts with the Streamlit UI font (Source Sans Pro) so everything matches,
+# and standardize on one designed navy palette so the deck looks intentional, not default-Plotly.
 _APP_FONT = "Source Sans Pro, -apple-system, Segoe UI, sans-serif"
+NAVY_SEQ = ["#1e40af", "#3b82f6", "#0ea5e9", "#6366f1", "#93c5fd", "#1e3a8a", "#60a5fa"]
 pio.templates.default = "plotly_white"
-pio.templates["plotly_white"].layout.font.family = _APP_FONT
+_tpl = pio.templates["plotly_white"].layout
+_tpl.font.family = _APP_FONT
+_tpl.colorway = NAVY_SEQ
+_tpl.title.font.size = 15
+_tpl.title.x = 0.0
+_tpl.title.xanchor = "left"
+_tpl.legend.title.text = ""
 px.defaults.template = "plotly_white"
+px.defaults.color_discrete_sequence = NAVY_SEQ
 
 import data
 import analytics
@@ -61,15 +70,44 @@ _require_login()
 PRIMARY = "#1e40af"
 RAG = {"Red": "#dc2626", "Yellow": "#f59e0b", "Green": "#16a34a"}
 NEUTRAL = "#6b7280"
+# Consistent category colors so a market / forecast category is the same hue on every chart.
+MARKET_COLORS = {"NetSuite": "#1e40af", "Sage": "#0ea5e9", "Dynamics": "#6366f1", "Other": "#94a3b8"}
+FCAT_COLORS = {"Commit": "#1e40af", "Best Case": "#3b82f6", "Pipeline": "#93c5fd",
+               "Not Forecasted": "#cbd5e1"}
+STAGE_COLORS = {"SQL-Booked": "#1e40af", "SQL-Held": "#3b82f6", "SAL": "#93c5fd"}
 METRIC_LABELS = {"sql_booked": "SQL-Booked", "sql_held": "SQL-Held", "sal": "SAL",
                  "pipeline_arr": "Pipeline ARR", "bookings_arr": "Bookings ARR"}
 MONEY = {"pipeline_arr", "bookings_arr", "pipeline_acv", "bookings_acv"}
 ALL_METRICS = analytics.FUNNEL_METRICS
-PORTAL_ID = "0000000"  # TODO: set Paystand HubSpot portal id to activate deep links
+
+# HubSpot deep links — progressive disclosure (V2): the deck answers "what", these dashboards
+# answer "why". Portal + dashboard view ids are the company's own, taken from the live deck.
+PORTAL_ID = "493201"
+_HS_BASE = "https://app.hubspot.com/reports-dashboard"
+HS_DASHBOARDS = {
+    "funnel":    ("15502490", "Sales funnel by ERP · week vs last"),
+    "pipeline":  ("16529206", "Pipeline performance"),
+    "waterfall": ("10979308", "Pipeline waterfall · WoW change"),
+    "marketing": ("15522896", "Marketing OKRs"),
+    "sdr":       ("15513084", "SDR / AE OKRs"),
+    "pods":      ("16035037", "Pod performance & win stats"),
+}
 
 
 def hs_deal_url(deal_id):
     return f"https://app.hubspot.com/contacts/{PORTAL_ID}/deal/{deal_id}"
+
+
+def hs_link(key):
+    """Render a subtle 'drill into HubSpot' link for a section (V2 progressive disclosure)."""
+    if key not in HS_DASHBOARDS:
+        return
+    view, label = HS_DASHBOARDS[key]
+    url = f"{_HS_BASE}/{PORTAL_ID}/view/{view}"
+    st.markdown(
+        f"<a href='{url}' target='_blank' style='font-size:0.86em;color:{PRIMARY};"
+        f"text-decoration:none;font-weight:600'>↗ Why: open “{label}” in HubSpot</a>",
+        unsafe_allow_html=True)
 
 
 def money(v):
@@ -490,17 +528,19 @@ if meeting == "TOF Review":
                              var_name="Stage", value_name="Count")
             melt["Stage"] = melt["Stage"].map(METRIC_LABELS)
             fig = px.bar(melt, x="market", y="Count", color="Stage", barmode="group",
-                         title="Funnel by Market (QTD)", category_orders={"market": MARKET_ORDER})
-            fig.update_layout(height=340)
+                         title="Funnel by Market (QTD)", category_orders={"market": MARKET_ORDER},
+                         color_discrete_map=STAGE_COLORS)
+            fig.update_layout(height=340, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             s2 = show.copy()
             s2["att"] = s2["market"].map(lambda mk: attainment(mk, "bookings_arr",
                         s2.loc[s2.market == mk, "bookings_arr"].iloc[0]) or 0)
             fig = px.bar(s2, x="att", y="market", orientation="h", text=s2["att"].map(lambda v: f"{v:.0f}%"),
-                         title="Bookings ARR attainment by Market", category_orders={"market": MARKET_ORDER})
+                         title="Bookings ARR attainment by Market", category_orders={"market": MARKET_ORDER},
+                         color="market", color_discrete_map=MARKET_COLORS)
             fig.add_vline(x=pace, line_dash="dash", annotation_text=f"pace {pace:.0f}%")
-            fig.update_layout(height=340, xaxis_title="% to plan")
+            fig.update_layout(height=340, xaxis_title="% to plan", yaxis_title="", showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
     def s_gtm():
@@ -512,20 +552,32 @@ if meeting == "TOF Review":
             f"**{_top_engine}** creates the most SQL-Booked; Channel contributes **{_ch_sql}** "
             "(our highest-priority growth lever per V2).",
             "If Channel is under-indexing, prioritize partner enablement; otherwise double down on the leading engine.")
-        st.caption("Channel gets dedicated visibility — our strongest acquisition source (V2).")
+        # Channel gets dedicated visibility — V2 calls it our strongest acquisition source.
+        if "Channels" in _gi.index:
+            cr = _gi.loc["Channels"]
+            st.markdown("**Channel spotlight** — dedicated visibility per V2")
+            ch = st.columns(4)
+            ch[0].metric("Channel SQL-Booked", f"{int(cr['sql_booked']):,}", help=help_for("SQL-Booked"))
+            ch[1].metric("Channel SQL-Held", f"{int(cr['sql_held']):,}", help=help_for("SQL-Held"))
+            ch[2].metric("Channel pipeline ARR", money(cr["pipeline_arr"]), help=help_for("Pipeline ARR"))
+            ch[3].metric("Channel bookings ARR", money(cr["bookings_arr"]), help=help_for("Bookings ARR"))
+            share = 100 * cr["sql_booked"] / gtm["sql_booked"].sum() if gtm["sql_booked"].sum() else 0
+            st.caption(f"Channel = {share:.0f}% of all SQL-Booked this quarter. "
+                       "It's our strongest acquisition source and a top growth lever (V2).")
         c1, c2 = st.columns(2)
         with c1:
             melt = gtm.melt(id_vars="gtm", value_vars=["sql_booked", "sql_held", "sal"],
                             var_name="Stage", value_name="Count")
             melt["Stage"] = melt["Stage"].map(METRIC_LABELS)
-            fig = px.bar(melt, x="gtm", y="Count", color="Stage", barmode="group", title="Funnel by GTM Engine (QTD)")
-            fig.update_layout(height=340)
+            fig = px.bar(melt, x="gtm", y="Count", color="Stage", barmode="group",
+                         title="Funnel by GTM Engine (QTD)", color_discrete_map=STAGE_COLORS)
+            fig.update_layout(height=340, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             g2 = gtm.copy(); g2["Bookings $K"] = g2["bookings_arr"] / 1e3
             fig = px.bar(g2, x="gtm", y="Bookings $K", title="Bookings ARR by GTM Engine ($K)",
                          color="gtm", text_auto=".0f")
-            fig.update_layout(height=340, showlegend=False)
+            fig.update_layout(height=340, showlegend=False, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
         gtm_disp = gtm[["gtm", "sql_booked", "sql_held", "sal", "held_rate", "sal_rate"]].copy()
         gtm_disp.columns = ["GTM Engine", "SQL-Booked", "SQL-Held", "SAL", "Held %", "SAL %"]
@@ -606,19 +658,19 @@ if meeting == "TOF Review":
 
     SLIDES = [
         {"id": "title", "title": "Top of Funnel Review", "sub": "", "render": s_title},
-        {"id": "exec", "title": "Executive Summary",
+        {"id": "exec", "title": "Executive Summary", "hs": "pipeline",
          "sub": "Are we creating enough future revenue, and are we on pace?", "render": s_exec},
-        {"id": "market", "title": "Market Performance",
+        {"id": "market", "title": "Market Performance", "hs": "funnel",
          "sub": "Where growth is coming from — and where it's slowing.", "render": s_market},
-        {"id": "gtm", "title": "GTM Engine",
+        {"id": "gtm", "title": "GTM Engine", "hs": "marketing",
          "sub": "Which acquisition engine produces repeatable pipeline.", "render": s_gtm},
-        {"id": "product", "title": "Product",
+        {"id": "product", "title": "Product", "hs": "pipeline",
          "sub": "AR / AP / Multi-product mix across pipeline and bookings.", "render": s_product},
-        {"id": "pxm", "title": "Product × Market",
+        {"id": "pxm", "title": "Product × Market", "hs": "pipeline",
          "sub": "Where product and market intersect on bookings.", "render": s_pxm},
-        {"id": "strategic", "title": "Strategic Priorities",
+        {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
          "sub": "The six weekly questions, answered with data.", "render": s_strategic},
-        {"id": "trends", "title": "Trends",
+        {"id": "trends", "title": "Trends", "hs": "waterfall",
          "sub": "Week-over-week funnel and bookings trajectory.", "render": s_trends},
         {"id": "actions", "title": "Actions & Decisions",
          "sub": "Decisions, owners, and follow-ups from today.", "render": s_actions},
@@ -757,8 +809,8 @@ else:
                 "Pipeline": x.loc[x.forecast_cat == "Pipeline", "acv"].sum()})).reset_index()
             m2 = mk.melt(id_vars="market", var_name="Category", value_name="ACV")
             fig = px.bar(m2, x="market", y="ACV", color="Category", title="Open ACV by Market × Forecast category",
-                         category_orders={"market": MARKET_ORDER})
-            fig.update_layout(height=340)
+                         category_orders={"market": MARKET_ORDER}, color_discrete_map=FCAT_COLORS)
+            fig.update_layout(height=340, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             t = df.groupby("market").agg(ACV=("acv", "sum"), Deals=("deal_id", "count")).reindex(MARKET_ORDER).dropna().reset_index()
@@ -778,8 +830,9 @@ else:
                 "Best Case": x.loc[x.forecast_cat == "Best Case", "acv"].sum(),
                 "Pipeline": x.loc[x.forecast_cat == "Pipeline", "acv"].sum()})).reset_index()
             pm = ps.melt(id_vars="product", var_name="Category", value_name="ACV")
-            fig = px.bar(pm, x="product", y="ACV", color="Category", title="Open ACV by Product × Forecast category")
-            fig.update_layout(height=320)
+            fig = px.bar(pm, x="product", y="ACV", color="Category",
+                         title="Open ACV by Product × Forecast category", color_discrete_map=FCAT_COLORS)
+            fig.update_layout(height=320, xaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
 
     def s_gtm():
@@ -882,23 +935,23 @@ else:
 
     SLIDES = [
         {"id": "title", "title": "Booking / Deals Review", "sub": "", "render": s_title},
-        {"id": "exec", "title": "Executive Forecast",
+        {"id": "exec", "title": "Executive Forecast", "hs": "pods",
          "sub": "Will we hit the number? Week / Month / Quarter view.", "render": s_exec},
-        {"id": "movement", "title": "Forecast Movement",
+        {"id": "movement", "title": "Forecast Movement", "hs": "waterfall",
          "sub": "What changed in the forecast week-over-week.", "render": s_movement},
-        {"id": "market", "title": "Market Forecast View",
+        {"id": "market", "title": "Market Forecast View", "hs": "funnel",
          "sub": "Which markets carry the forecast — and the risk.", "render": s_market},
-        {"id": "product", "title": "Product Forecast View",
+        {"id": "product", "title": "Product Forecast View", "hs": "pipeline",
          "sub": "Open ACV by product and forecast category.", "render": s_product},
-        {"id": "gtm", "title": "GTM Engine View",
+        {"id": "gtm", "title": "GTM Engine View", "hs": "sdr",
          "sub": "Open pipeline ACV by acquisition engine.", "render": s_gtm},
-        {"id": "pxm", "title": "Product × Market View",
+        {"id": "pxm", "title": "Product × Market View", "hs": "pipeline",
          "sub": "Where open ACV concentrates across product and market.", "render": s_pxm},
-        {"id": "strategic", "title": "Strategic Priorities",
+        {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
          "sub": "The six weekly questions, answered with data.", "render": s_strategic},
-        {"id": "pods", "title": "Pod Reviews",
+        {"id": "pods", "title": "Pod Reviews", "hs": "pods",
          "sub": "Status, wins, risks, and exec support by pod.", "render": s_pods},
-        {"id": "watchlist", "title": "Deal Watchlist",
+        {"id": "watchlist", "title": "Deal Watchlist", "hs": "pipeline",
          "sub": "Largest at-risk deals with recommended forecast actions.", "render": s_watchlist},
         {"id": "actions", "title": "Actions & Decisions",
          "sub": "Decisions, owners, and follow-ups from today.", "render": s_actions},
@@ -940,6 +993,8 @@ if present:
     slide = SLIDES[idx]
     slide_header(idx + 1, total, slide["title"], slide.get("sub", ""))
     slide["render"]()
+    if slide.get("hs"):
+        hs_link(slide["hs"])
     if slide["id"] != "title":
         talking_points(slide["id"])
 
@@ -952,6 +1007,11 @@ if present:
                    unsafe_allow_html=True)
     bn[2].button("Next  ▶", use_container_width=True, disabled=(idx == total - 1),
                  key="nav_next_b", on_click=_go, args=(1,))
+    st.markdown(
+        f"<div style='text-align:center;color:#94a3b8;font-size:0.78rem;margin-top:6px'>"
+        f"Paystand · {meeting} · {pacing['quarter_label']} · Confidential · "
+        f"data from HubSpot, updated {pacing['today']:%b %d %Y}</div>",
+        unsafe_allow_html=True)
 else:
     st.markdown(f"## {meeting} · {pacing['quarter_label']}")
     st.caption(f"*{core_q}*  ·  {pacing['days_remaining']} days remaining  ·  "
@@ -959,6 +1019,8 @@ else:
     for i, slide in enumerate([s for s in SLIDES if s["id"] != "title"], start=1):
         st.markdown(f"### {i}. {slide['title']}")
         slide["render"]()
+        if slide.get("hs"):
+            hs_link(slide["hs"])
         st.divider()
     drill_extras()
 
