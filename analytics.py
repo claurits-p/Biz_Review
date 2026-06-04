@@ -225,6 +225,7 @@ def open_pipeline(today: dt.date) -> pd.DataFrame:
     df["hs_prob"] = hs_prob.where(hs_prob <= 1.0, hs_prob / 100.0)
     df["prob"] = df["stage_prob"]
     df["weighted_acv"] = df["acv"] * df["stage_prob"]
+    df["weighted_arr"] = df["arr"] * df["stage_prob"]
     # Hygiene: is the rep's forecast category more optimistic than the stage allows?
     df["cat_ahead_of_stage"] = df.apply(
         lambda r: _CAT_RANK.get(r.forecast_cat, 0) > STAGE_MAX_RANK.get(r.stage, 3), axis=1)
@@ -363,7 +364,9 @@ def closed_won(quarter_start, today) -> pd.DataFrame:
       CAST(d.owner_id AS STRING) AS owner_id,
       d.property_accounting_erp_software AS erp_raw,
       d.property_use_case AS use_case,
-      SAFE_CAST(d.property_total_arr AS FLOAT64)        AS arr,
+      -- Use property_arr (the canonical ARR used everywhere else in the app) so the Wins slide
+      -- reconciles with Bookings ARR on the exec slides. (Was property_total_arr, ~5% higher.)
+      SAFE_CAST(d.property_arr AS FLOAT64)              AS arr,
       SAFE_CAST(d.property_total_ar_ap_acv AS FLOAT64)  AS acv,
       SAFE_CAST(d.property_days_to_close AS FLOAT64)    AS days_to_close,
       d.property_associated_parner_var AS partner,
@@ -388,10 +391,13 @@ def closed_won(quarter_start, today) -> pd.DataFrame:
 
 
 def forecast_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    """ACV by HubSpot forecast category (rep's call = source of truth). Weighted uses
-    HubSpot's own deal-stage probability rather than invented category weights."""
+    """$ by HubSpot forecast category (rep's call = source of truth), in BOTH ARR and ACV so the
+    deck can show each against its own plan. Weighted uses the AE Forecast-Hygiene stage
+    probability, not invented category weights."""
     g = df.groupby("forecast_cat").agg(deals=("deal_id", "count"),
+                                       arr=("arr", "sum"),
                                        acv=("acv", "sum"),
+                                       weighted_arr=("weighted_arr", "sum"),
                                        weighted_acv=("weighted_acv", "sum")).reset_index()
     order = ["Commit", "Best Case", "Pipeline", "Not Forecasted"]
     g["__o"] = g["forecast_cat"].map({k: i for i, k in enumerate(order)})
@@ -411,8 +417,12 @@ def pod_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def forecast_windows(df: pd.DataFrame, today) -> dict:
-    """Forecast at Week / Month / Quarter levels (Booking V2 #1).
-    Window = open deals expected to close by the end of each horizon (nested)."""
+    """Forecast at Week / Month / Quarter levels (Booking V2 #1), in BOTH ARR and ACV.
+
+    Window = open deals expected to close by the end of each horizon (nested by `closedate`).
+    `overdue` counts deals whose close date is already in the past (still open) — they fall into
+    every horizon, so we surface the count instead of hiding it.
+    """
     t = pd.Timestamp(today)
     week_end = t + pd.Timedelta(days=6 - t.weekday())
     month_end = t + pd.offsets.MonthEnd(0)
@@ -422,13 +432,19 @@ def forecast_windows(df: pd.DataFrame, today) -> dict:
     out = {}
     for name, end in [("Week", week_end), ("Month", month_end), ("Quarter", q_end)]:
         sub = df[cd <= end]
+        c = sub.forecast_cat
         out[name] = {
             "end": end.date(),
             "deals": len(sub),
+            "overdue": int((cd < t).sum()) if name == "Week" else int(((cd <= end) & (cd < t)).sum()),
             "total": float(sub["acv"].sum()),
-            "commit": float(sub.loc[sub.forecast_cat == "Commit", "acv"].sum()),
-            "best": float(sub.loc[sub.forecast_cat == "Best Case", "acv"].sum()),
+            "commit": float(sub.loc[c == "Commit", "acv"].sum()),
+            "best": float(sub.loc[c == "Best Case", "acv"].sum()),
             "weighted": float(sub["weighted_acv"].sum()) if len(sub) else 0.0,
+            "total_arr": float(sub["arr"].sum()),
+            "commit_arr": float(sub.loc[c == "Commit", "arr"].sum()),
+            "best_arr": float(sub.loc[c == "Best Case", "arr"].sum()),
+            "weighted_arr": float(sub["weighted_arr"].sum()) if len(sub) else 0.0,
         }
     return out
 

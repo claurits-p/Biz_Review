@@ -12,6 +12,8 @@ talking points). Drill-down = the full scrolling dashboard with supporting detai
 """
 import datetime as dt
 import re
+import os
+import base64
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -80,6 +82,7 @@ if not getattr(st, "_bizreview_dollar_patched", False):
 
 import data
 import analytics
+import proposal as P
 import goals as goalstore
 import actions as actionstore
 import snapshots
@@ -122,7 +125,8 @@ FCAT_COLORS = {"Commit": "#1e40af", "Best Case": "#3b82f6", "Pipeline": "#93c5fd
                "Not Forecasted": "#cbd5e1"}
 STAGE_COLORS = {"SQL-Booked": "#1e40af", "SQL-Held": "#3b82f6", "SAL": "#93c5fd"}
 METRIC_LABELS = {"sql_booked": "SQL-Booked", "sql_held": "SQL-Held", "sal": "SAL",
-                 "pipeline_arr": "Pipeline ARR", "bookings_arr": "Bookings ARR"}
+                 "pipeline_arr": "Pipeline ARR", "bookings_arr": "Bookings ARR",
+                 "bookings_acv": "Bookings ACV"}
 MONEY = {"pipeline_arr", "bookings_arr", "pipeline_acv", "bookings_acv",
          "pipeline_arr_sal", "pipeline_acv_sal"}
 ALL_METRICS = analytics.FUNNEL_METRICS
@@ -195,6 +199,25 @@ def load_won(today_iso: str):
     return analytics.closed_won(p["quarter_start"], today)
 
 
+# ---- Proposal-deck loaders (boss's TOF deck, 06-04-2026). Cached so click-through stays fast.
+@st.cache_data(ttl=3600)
+def load_prop(today_iso: str):
+    t = dt.date.fromisoformat(today_iso)
+    return {"exec": P.exec_kpis(t), "bookings_q": P.bookings_quarterly(t),
+            "keystats": P.key_stats_by_erp(t), "gtmperf": P.gtm_engine_performance(t),
+            "velocity": P.stage_velocity(t), "product": P.product_performance(t)}
+
+
+@st.cache_data(ttl=3600)
+def load_winrate(today_iso: str, dim: str, grain: str):
+    return P.win_rate_matrix(dt.date.fromisoformat(today_iso), dim, grain)
+
+
+@st.cache_data(ttl=3600)
+def load_conversion(today_iso: str, grain: str):
+    return P.stage_conversion(dt.date.fromisoformat(today_iso), grain)
+
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.markdown("### Paystand Business Review")
@@ -211,7 +234,7 @@ with st.sidebar:
         existing = goalstore.get_goals(qkey)
         for mk in MARKET_ORDER:
             st.markdown(f"**{mk}**")
-            cols = st.columns(5)
+            cols = st.columns(len(goalstore.METRICS))
             for i, metric in enumerate(goalstore.METRICS):
                 cur = existing.get(mk, {}).get(metric, 0)
                 val = cols[i].number_input(METRIC_LABELS[metric], min_value=0.0,
@@ -224,11 +247,51 @@ today = snap
 pacing, base, wow = load_tof(today.isoformat())
 qkey = pacing["quarter_key"]
 pace = pacing["pct_elapsed"]
+
+# ---- Use-case (product) filter -------------------------------------------------------------
+# One clickable control (All + product buckets) slices every $/count on the slide by use case.
+# The selection lives in session_state so it persists as you click through the deck, and is read
+# here (before metrics are computed) while the widget itself is rendered on each slide.
+PRODUCT_FILTER_ORDER = ["AR", "AP", "Multi-Product", "Other", "Unknown"]
+_prod_key = f"prodfilter_{meeting}"
+
+
+def current_product_filter():
+    return st.session_state.get(_prod_key, "All")
+
+
+def product_filter_options(*frames):
+    present = set()
+    for f in frames:
+        if f is not None and "product" in getattr(f, "columns", []):
+            present |= {str(x) for x in f["product"].dropna().unique()}
+    return ["All"] + [b for b in PRODUCT_FILTER_ORDER if b in present]
+
+
+def render_product_filter(options):
+    """Clickable use-case filter. No-op when there's nothing to slice."""
+    if not options or len(options) <= 1:
+        return
+    if st.session_state.get(_prod_key) not in options:
+        st.session_state[_prod_key] = "All"
+    st.radio("Use case", options, horizontal=True, key=_prod_key,
+             help="Filter the metrics on this slide by product / use case.")
+
+
+base_full = base
+PRODUCT_OPTIONS = product_filter_options(base_full)
+# Clamp any stale/invalid selection (e.g. options changed between runs) before widgets render.
+if st.session_state.get(_prod_key) not in PRODUCT_OPTIONS:
+    st.session_state[_prod_key] = "All"
+_prod = current_product_filter()
+if _prod != "All" and "product" in base.columns:
+    base = base[base["product"] == _prod]
+
 market_funnel = analytics.dim_funnel(base, "market").rename(columns={"dim": "market"})
 
-# Backfill reconstructed weekly snapshots so WoW / Trends / Forecast Movement are live now
-# (instead of waiting weeks to accrue). Idempotent — only writes dates not already stored.
-_hist = analytics.historical_snapshots(base, pacing["quarter_start"], today)
+# Backfill reconstructed weekly snapshots from the FULL (unfiltered) base so the persistent
+# snapshot store stays company-wide regardless of the active use-case filter. Idempotent.
+_hist = analytics.historical_snapshots(base_full, pacing["quarter_start"], today)
 if not snapshots.has_dates(_hist.keys()):
     snapshots.backfill(_hist)
 
@@ -389,36 +452,124 @@ def strategic_priorities(meeting_key):
 # ============================================================================
 # Deck styling + slide helpers
 # ============================================================================
-def inject_deck_css(present: bool):
-    """Make Present mode feel like a slide deck (big titles, larger metrics,
-    roomy spacing). Drill-down keeps the compact dashboard look.
+# ---- Design system (emulates the Paystand proposal-deck look) -----------------------------
+NAVY = "#16243f"
+INK = "#0f172a"
+GOOD, GOOD_BG = "#16a34a", "#dcfce7"
+BAD, BAD_BG = "#dc2626", "#fee2e2"
+TRACK, MUTE = "#e9edf3", "#94a3b8"
+# Accent per GTM engine (matches reference: Marketing orange, Channels blue, Outbound amber).
+ENGINE_ACCENT = {"Marketing": "#f97316", "Channels": "#3b82f6", "Outbound": "#f59e0b", "AE": "#8b5cf6"}
+# Consistent ERP hues for bars/lines.
+ERP_HUE = {"NetSuite": "#1e40af", "Sage": "#0ea5e9", "Microsoft": "#6366f1",
+           "Acumatica": "#14b8a6", "Other": "#94a3b8"}
 
-    NOTE: lines must NOT be indented 4+ spaces — Streamlit's markdown renders
-    indented blocks as literal code, which would print the raw <style> tag.
+
+@st.cache_data(ttl=86400)
+def _logo_b64():
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "assets", "paystand_logo.png"), "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception:
+        return ""
+
+
+def inject_deck_css(present: bool):
+    """Slide-deck styling that emulates the reference proposal deck: light canvas, white slide
+    card, big navy titles, rounded colored boxes, pill toggles.
+
+    NOTE: lines must NOT be indented 4+ spaces — Streamlit's markdown renders indented blocks as
+    literal code, which would print the raw <style> tag.
     """
     rules = [
-        ".slide-kicker {color:#64748b;font-weight:700;letter-spacing:.09em;text-transform:uppercase;font-size:.78rem;margin:0 0 2px;}",
-        ".slide-h1 {font-size:2.15rem;font-weight:800;color:#0f172a;margin:0 0 4px;line-height:1.12;}",
-        ".slide-sub {color:#475569;font-size:1.04rem;margin:0 0 14px;}",
-        ".hero-q {font-size:2.5rem;font-weight:800;color:#1e40af;margin:8px 0 22px;line-height:1.15;}",
-        ".slide-rule {border:none;border-top:3px solid #1e40af;width:64px;margin:0 0 14px;opacity:.9;}",
+        ".slide-kicker {color:#64748b;font-weight:700;letter-spacing:.10em;text-transform:uppercase;font-size:.8rem;margin:0 0 3px;}",
+        ".slide-h1 {font-size:2.3rem;font-weight:800;color:#0f172a;margin:0 0 3px;line-height:1.1;}",
+        ".slide-sub {color:#64748b;font-size:1.02rem;margin:0;}",
+        ".slide-rule {border:none;border-top:2px solid #e2e8f0;margin:12px 0 16px;}",
+        ".sect-h {color:#334155;font-weight:800;font-size:1.0rem;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em;}",
     ]
     if present:
         rules += [
             '[data-testid="stMetricValue"] {font-size:2.0rem;}',
             '[data-testid="stMetricLabel"] {font-size:0.95rem;}',
-            "section.main > div.block-container {padding-top:2.2rem;max-width:1250px;}",
+            "section.main > div.block-container {padding-top:2.0rem;max-width:1280px;}",
+            "section.main {background:#f1f5f9;}",
+            # Pill toggle look for the W/M/Q button group.
+            'div[data-testid="stHorizontalBlock"] button[kind="secondary"] {background:#e9edf3;border:none;color:#64748b;font-weight:700;border-radius:8px;}',
+            'div[data-testid="stHorizontalBlock"] button[kind="primary"] {background:#16243f;border:none;color:#fff;font-weight:800;border-radius:8px;}',
         ]
     st.markdown("<style>" + " ".join(rules) + "</style>", unsafe_allow_html=True)
 
 
 def slide_header(idx, total, title, subtitle=""):
-    st.markdown(f"<div class='slide-kicker'>{meeting} · {pacing['quarter_label']} · "
-                f"Slide {idx} of {total}</div>", unsafe_allow_html=True)
-    st.markdown(f"<h1 class='slide-h1'>{title}</h1>", unsafe_allow_html=True)
-    st.markdown("<hr class='slide-rule'>", unsafe_allow_html=True)
-    if subtitle:
-        st.markdown(f"<div class='slide-sub'>{subtitle}</div>", unsafe_allow_html=True)
+    badge = (f"<div style='background:{NAVY};color:#fff;border-radius:12px;padding:8px 20px;"
+             f"text-align:right;white-space:nowrap'>"
+             f"<div style='font-size:.72rem;color:#cbd5e1;font-weight:600'>Paystand</div>"
+             f"<div style='font-size:1.5rem;font-weight:800;line-height:1'>AR</div></div>")
+    st.markdown(
+        f"<div style='display:flex;justify-content:space-between;align-items:flex-start;gap:18px'>"
+        f"<div><div class='slide-kicker'>{meeting} · {pacing['quarter_label']} · Slide {idx} of {total}</div>"
+        f"<div class='slide-h1'>{title}</div>"
+        + (f"<div class='slide-sub'>{subtitle}</div>" if subtitle else "")
+        + f"</div>{badge}</div><hr class='slide-rule'>", unsafe_allow_html=True)
+
+
+def slide_footer():
+    """Blue rule + Paystand logo (left) + copyright (right), like the reference slides."""
+    b = _logo_b64()
+    logo = (f"<img src='data:image/png;base64,{b}' style='height:24px'>" if b
+            else f"<span style='color:{NAVY};font-weight:800;font-size:1.1rem'>paystand</span>")
+    st.markdown(
+        f"<div style='border-top:2px solid {NAVY};margin-top:20px;padding-top:8px;display:flex;"
+        f"justify-content:space-between;align-items:center'>{logo}"
+        f"<span style='color:#94a3b8;font-size:.76rem'>© Paystand, inc. 2026. All rights reserved · "
+        f"{pacing['quarter_label']} · Confidential</span></div>", unsafe_allow_html=True)
+
+
+def hbar(value_label, pct, color, height=22, outlined=False):
+    """Horizontal bar on a grey track. Filled (white label) or outlined (colored label) style."""
+    pct = max(0, min(100, pct or 0))
+    if outlined:
+        inner = (f"<div style='width:{pct:.0f}%;min-width:64px;background:{color}1f;border:1.5px solid {color};"
+                 f"height:100%;border-radius:6px;display:flex;align-items:center;padding-left:10px;"
+                 f"color:{color};font-weight:700;font-size:.78rem;white-space:nowrap'>{value_label}</div>")
+    else:
+        inner = (f"<div style='width:{pct:.0f}%;min-width:52px;background:{color};height:100%;border-radius:6px;"
+                 f"display:flex;align-items:center;padding-left:10px;color:#fff;font-weight:700;"
+                 f"font-size:.78rem;white-space:nowrap'>{value_label}</div>")
+    return f"<div style='background:{TRACK};border-radius:6px;height:{height}px;width:100%'>{inner}</div>"
+
+
+def status_pill(status):
+    m = {"On pace": (GOOD, GOOD_BG, "ON PACE"), "Slow": (BAD, BAD_BG, "SLOW"),
+         "Below": (BAD, BAD_BG, "BELOW"), "—": (MUTE, "#f1f5f9", "N/A")}
+    c, bg, txt = m.get(status, (MUTE, "#f1f5f9", str(status).upper()))
+    return (f"<span style='background:{bg};color:{c};font-weight:800;font-size:.7rem;"
+            f"padding:3px 10px;border-radius:6px'>{txt}</span>")
+
+
+def delta_text(delta, good_when_negative=False):
+    """Coloured ▲/▼ delta string, e.g. '▲ -3d faster' (green) or '▼ +7d slower' (red)."""
+    if delta is None:
+        return ""
+    is_good = (delta <= 0) if good_when_negative else (delta >= 0)
+    c = GOOD if is_good else BAD
+    arr = "▲" if delta >= 0 else "▼"
+    return f"<span style='color:{c};font-weight:700'>{arr} {delta:+.0f}</span>"
+
+
+def seg_toggle(key, options=("Weekly", "Monthly", "Quarterly"), default_index=2):
+    """Segmented pill button group (replaces a radio). Returns the selected option."""
+    if key not in st.session_state:
+        st.session_state[key] = options[default_index]
+    cols = st.columns(len(options))
+    for c, opt in zip(cols, options):
+        active = st.session_state[key] == opt
+        if c.button(opt, key=f"{key}__{opt}", use_container_width=True,
+                    type="primary" if active else "secondary"):
+            st.session_state[key] = opt
+            st.rerun()
+    return st.session_state[key]
 
 
 def talking_points(slide_id):
@@ -865,48 +1016,420 @@ if meeting == "TOF Review":
         st.dataframe(analytics.dim_funnel(base, "product").rename(columns={"dim": "product"}),
                      use_container_width=True, hide_index=True)
 
+    # ========================================================================
+    # Boss proposal deck (Business Review Deck_Proposal 06-04-2026) — TOF only.
+    # Each slide mirrors a slide in the boss's deck; data comes from proposal.py.
+    # ========================================================================
+    pr = load_prop(today.isoformat())
+
+    def html_table(columns, rows, first_col="Metric", align_first="left"):
+        """Compact styled table: navy header, zebra rows, right-aligned numeric cells."""
+        head = f"<th style='padding:9px 14px;text-align:{align_first}'>{first_col}</th>" + "".join(
+            f"<th style='padding:9px 14px;text-align:right;font-weight:700'>{c}</th>" for c in columns)
+        body = ""
+        for i, (lbl, cells) in enumerate(rows):
+            bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+            tds = "".join(f"<td style='padding:9px 14px;text-align:right;color:#0f172a'>{c}</td>" for c in cells)
+            body += (f"<tr style='background:{bg}'><td style='padding:9px 14px;font-weight:700;"
+                     f"color:#334155'>{lbl}</td>{tds}</tr>")
+        return (f"<table style='width:100%;border-collapse:collapse;font-size:.88rem;border:1px solid "
+                f"#e2e8f0;border-radius:10px;overflow:hidden'><thead><tr style='background:{NAVY};"
+                f"color:#fff'>{head}</tr></thead><tbody>{body}</tbody></table>")
+
+    def p_title():
+        b = _logo_b64()
+        logo = (f"<img src='data:image/png;base64,{b}' style='height:40px;margin-bottom:26px'>" if b else "")
+        st.markdown(
+            f"<div style='text-align:center;padding:70px 0 50px'>{logo}"
+            f"<div style='color:{NAVY};font-weight:800;font-size:3.2rem;line-height:1.05'>2026 Sales Plan</div>"
+            f"<div style='display:inline-block;margin-top:18px;background:{NAVY};color:#fff;padding:8px 26px;"
+            f"border-radius:10px;font-size:1.15rem;font-weight:700'>Top of Funnel · AR Performance</div>"
+            f"<div style='color:#94a3b8;margin-top:16px'>{pacing['quarter_label']} · "
+            f"updated {pacing['today']:%b %d, %Y}</div></div>", unsafe_allow_html=True)
+
+    def p_section():
+        st.markdown(
+            f"<div style='text-align:center;padding:110px 0'>"
+            f"<div style='display:inline-block;background:{NAVY};color:#fff;padding:20px 56px;border-radius:16px;"
+            f"font-size:2.4rem;font-weight:800;letter-spacing:.02em'>TOF Slides</div>"
+            f"<div style='color:#64748b;margin-top:18px;font-size:1.05rem'>Top-of-Funnel performance · "
+            f"{pacing['quarter_label']}</div></div>", unsafe_allow_html=True)
+
+    def p_exec():
+        e = pr["exec"]
+        lbl = e["_labels"]
+        specs = [("sql_booked", "SQL Booked", False), ("sql_held", "SQL Held", False),
+                 ("sal", "SAL", False), ("pipeline_arr", "ARR Pipeline", True),
+                 ("bookings_arr", "ARR Bookings", True), ("bookings_acv", "ACV Bookings", True)]
+
+        def card(m, label, ismoney):
+            d = e[m]
+            att = company_attainment(m)[0]
+            val = money(d["value"]) if ismoney else f"{d['value']:,.0f}"
+            att_html = (f"<span style='color:#1e40af;font-weight:800'>{att:.0f}%</span>"
+                        f"<span style='color:#94a3b8;font-size:.72rem'> att.</span>"
+                        if att is not None else "<span style='color:#94a3b8;font-size:.78rem'>no goal set</span>")
+            wow_html = ""
+            if d["wow"] is not None:
+                c = GOOD if d["wow"] >= 0 else BAD
+                arr = "▲" if d["wow"] >= 0 else "▼"
+                wow_html = (f"&nbsp;&nbsp;<span style='color:{c};font-weight:800'>{arr} {d['wow']:+.0f}%</span>"
+                            f"<span style='color:#94a3b8;font-size:.72rem'> WoW</span>")
+            cmps = []
+            for key, qlab in (("vs_prior_q", lbl["prior_q"]), ("vs_year_q", lbl["year_q"])):
+                v = d[key]
+                if v is not None:
+                    cc = GOOD if v >= 0 else BAD
+                    cmps.append(f"<span style='color:{cc};font-weight:700'>{v:+.0f}%</span> "
+                                f"<span style='color:#94a3b8'>{qlab}</span>")
+            return (f"<div style='background:#fff;border:1px solid #e2e8f0;border-top:4px solid {NAVY};"
+                    f"border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(15,23,42,.06)'>"
+                    f"<div style='color:#64748b;font-weight:700;font-size:.78rem;text-transform:uppercase;"
+                    f"letter-spacing:.05em'>{label}</div>"
+                    f"<div style='font-size:2.05rem;font-weight:800;color:{INK};line-height:1.05;"
+                    f"margin:3px 0 5px'>{val}</div>"
+                    f"<div style='font-size:.82rem;margin-bottom:3px'>{att_html}{wow_html}</div>"
+                    f"<div style='font-size:.76rem'>{' · '.join(cmps)}</div></div>")
+
+        for rowspec in (specs[:3], specs[3:]):
+            cols = st.columns(3)
+            for col, (m, label, ismoney) in zip(cols, rowspec):
+                col.markdown(card(m, label, ismoney), unsafe_allow_html=True)
+
+        st.markdown("<div class='sect-h'>Trends — quarter over quarter</div>", unsafe_allow_html=True)
+        bq = pr["bookings_q"]
+        c1, c2 = st.columns(2)
+        if not bq.empty:
+            q = (bq.groupby(["q", "qlabel"]).agg(arr=("arr", "sum"), acv=("acv", "sum"),
+                                                 deals=("deals", "sum")).reset_index().sort_values("q"))
+            q["avg_acv"] = q["acv"] / q["deals"].replace(0, pd.NA)
+            q["Bookings $K"] = q["arr"] / 1e3
+            q["Avg ACV $K"] = q["avg_acv"] / 1e3
+            order = list(q["qlabel"])
+            with c1:
+                fig = px.bar(q, x="qlabel", y="Bookings $K", text_auto=".0f",
+                             category_orders={"qlabel": order}, title="How are bookings trending over time?")
+                fig.update_traces(marker_color=PRIMARY)
+                fig.update_layout(height=300, xaxis_title="", bargap=0.35)
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = px.line(q, x="qlabel", y="Avg ACV $K", markers=True,
+                              category_orders={"qlabel": order},
+                              title="How is average deal size trending over time?")
+                fig.update_traces(line={"color": "#0ea5e9", "width": 3})
+                fig.update_layout(height=300, xaxis_title="")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No closed-won history to plot.")
+
+    def p_bookings():
+        bq = pr["bookings_q"]
+        decision_callout(
+            "How are bookings trending over time, by ERP?",
+            "Quarterly closed-won ARR by ERP ecosystem (NetSuite · Sage · Microsoft · Acumatica · Other).",
+            "Spot which ERP is carrying bookings and which is fading quarter over quarter.")
+        if bq.empty:
+            st.info("No closed-won history to plot.")
+            return
+        b = bq.copy()
+        b["ARR $K"] = b["arr"] / 1e3
+        order = list(b.sort_values("q")["qlabel"].unique())
+        fig = px.bar(b, x="qlabel", y="ARR $K", color="erp", barmode="group",
+                     category_orders={"qlabel": order, "erp": P.ERP5_ORDER}, color_discrete_map=ERP_HUE,
+                     title="Quarterly bookings ARR by ERP")
+        fig.update_layout(height=440, xaxis_title="", legend={"orientation": "h"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    def p_keystats():
+        ks = pr["keystats"]
+        plbl = pr["exec"]["_labels"]["prior_q"]
+        decision_callout(
+            "AR key stats by ERP",
+            "Closed-won, avg ACV, logos, sales cycle, mix and open pipeline by ERP (QTD).",
+            "Focus coaching on the ERP with the weakest conversion / longest cycle relative to its pipeline.")
+        erps = P.ERP5_ORDER
+
+        def dcell(cur, prior, fmt):
+            base = fmt(cur)
+            if prior and prior > 0:
+                dv = (cur - prior) / prior * 100
+                c = GOOD if dv >= 0 else BAD
+                return f"{base}<div style='font-size:.7rem;color:{c};font-weight:600'>{dv:+.0f}% {plbl}</div>"
+            return base
+        rows = [
+            ("Closed Won", [dcell(ks.loc[e, "won_arr"], ks.loc[e, "won_arr_prior"], money) for e in erps]),
+            ("Avg ACV", [money(ks.loc[e, "avg_acv"]) for e in erps]),
+            ("New Logos", [dcell(ks.loc[e, "logos"], ks.loc[e, "logos_prior"], lambda v: f"{int(v)}") for e in erps]),
+            ("Sales Cycle", [f"{ks.loc[e, 'cycle']:.0f}d" for e in erps]),
+            ("Logo %", [f"{ks.loc[e, 'logo_pct']:.0f}%" for e in erps]),
+            ("Bookings %", [f"{ks.loc[e, 'bookings_pct']:.0f}%" for e in erps]),
+            ("Open Pipeline", [money(ks.loc[e, "open_arr"]) for e in erps]),
+        ]
+        st.markdown(html_table(erps, rows, "Key metric"), unsafe_allow_html=True)
+        st.caption("Closed Won / New Logos show the change vs the prior quarter. Sales Cycle = avg days-to-close; "
+                   "Open Pipeline = current open Sales-Pipeline ARR.")
+
+    def _winrate_slide(dim, question):
+        grain = seg_toggle(f"wr_{dim}")
+        rate, counts, window = load_winrate(today.isoformat(), dim, grain)
+        decision_callout(
+            question,
+            f"Win rate = won ÷ closed · {grain.lower()} window ({window}). Grey = no closed deals in that cell.",
+            "Target segments / engines with healthy volume but low win rate for deal-coaching.")
+        cols = list(rate.columns)
+        head = ("<th style='padding:9px 14px;text-align:left'>Segment</th>" + "".join(
+            f"<th style='padding:9px 14px;text-align:center;font-weight:700'>{c}</th>" for c in cols))
+        body = ""
+        for seg in rate.index:
+            tds = ""
+            for c in cols:
+                v, n = rate.loc[seg, c], counts.loc[seg, c]
+                if pd.isna(v):
+                    tds += ("<td style='padding:9px;text-align:center;background:#f1f5f9;color:#cbd5e1;"
+                            "border:2px solid #fff'>—</td>")
+                else:
+                    fg, bg = ((GOOD, GOOD_BG) if v >= 20 else
+                              (("#b45309", "#fef3c7") if v >= 10 else (BAD, BAD_BG)))
+                    nstr = "" if pd.isna(n) else f"<div style='font-size:.64rem;color:#94a3b8'>n={int(n)}</div>"
+                    tds += (f"<td style='padding:9px;text-align:center;background:{bg};border:2px solid #fff'>"
+                            f"<span style='color:{fg};font-weight:800'>{v:.0f}%</span>{nstr}</td>")
+            body += f"<tr><td style='padding:9px 14px;font-weight:700;color:#334155'>{seg}</td>{tds}</tr>"
+        st.markdown(f"<table style='width:100%;border-collapse:collapse;font-size:.9rem'>"
+                    f"<thead><tr style='background:{NAVY};color:#fff'>{head}</tr></thead>"
+                    f"<tbody>{body}</tbody></table>", unsafe_allow_html=True)
+        st.caption("Cells coloured by win rate — green ≥20%, amber 10–20%, red <10%; n = closed deals in the cell. "
+                   "Low-n cells are noisy.")
+
+    def p_winrate_erp():
+        _winrate_slide("erp", "Where are we winning? (segment × ERP)")
+
+    def p_winrate_gtm():
+        _winrate_slide("gtm", "Which acquisition engine is producing bookings? (segment × GTM)")
+
+    def p_gtmperf():
+        gp = pr["gtmperf"]
+        decision_callout(
+            "Which GTM engine is producing pipeline?",
+            "SAL-qualified pipeline ARR by engine, split by ERP (QTD).",
+            "Invest behind the engine with the best pipeline efficiency; shore up the laggard.")
+        for eng in P.GTM4_ORDER:
+            if eng not in gp.index:
+                continue
+            r = gp.loc[eng]
+            color = ENGINE_ACCENT.get(eng, "#3b82f6")
+            total = float(r["Total"]) or 1.0
+            bars = ""
+            for erp in ["Total"] + P.ERP5_ORDER:
+                val = float(total if erp == "Total" else r[erp])
+                pct = val / total * 100
+                share = "" if erp == "Total" else f"{val / total * 100:.0f}% of engine"
+                bars += (f"<div style='display:flex;align-items:center;gap:12px;margin:3px 0'>"
+                         f"<div style='width:84px;color:#334155;font-weight:600;font-size:.8rem'>{erp}</div>"
+                         f"<div style='flex:1'>{hbar(money(val), pct, color, height=20, outlined=True)}</div>"
+                         f"<div style='width:88px;color:#94a3b8;font-size:.74rem;text-align:right'>{share}</div></div>")
+            label = (f"<div style='min-width:160px'>"
+                     f"<div style='font-size:1.3rem;font-weight:800;color:{color}'>{eng}</div>"
+                     f"<div style='color:#475569;font-size:.84rem'>{money(total)} pipeline</div>"
+                     f"<div style='color:#94a3b8;font-size:.84rem'>{r['pct_total']:.0f}% of total</div></div>")
+            st.markdown(
+                f"<div style='border:2px solid {color};background:{color}0d;border-radius:14px;padding:14px 18px;"
+                f"margin-bottom:12px;display:flex;gap:20px;align-items:center'>{label}"
+                f"<div style='flex:1'>{bars}</div></div>", unsafe_allow_html=True)
+
+    def p_velocity():
+        vel, actual_close, bench_close = pr["velocity"]
+        decision_callout(
+            "How fast does pipeline move?",
+            f"Average days in each stage vs benchmark; actual days-to-close {actual_close}d vs "
+            f"benchmark {bench_close}d.",
+            "Attack the slowest stage relative to benchmark to compress cycle time.")
+        seg_colors = ["#3b82f6", "#f97316", "#f59e0b", "#3b82f6"]
+        ribbon = ""
+        for (_, r), c in zip(vel.iterrows(), seg_colors):
+            ribbon += (f"<div style='flex:{max(int(r['days']), 1)};background:{c};color:#fff;text-align:center;"
+                       f"padding:12px 6px'><div style='font-size:.82rem;font-weight:700'>{r['stage']}</div>"
+                       f"<div style='font-size:1.05rem;font-weight:800'>{r['days']:.0f} days</div></div>")
+        st.markdown(f"<div style='display:flex;gap:3px;border-radius:10px;overflow:hidden'>{ribbon}</div>",
+                    unsafe_allow_html=True)
+        mx = max(actual_close, bench_close) or 1
+        st.markdown(
+            f"<div style='margin-top:16px'>"
+            f"<div style='color:#334155;font-weight:600;font-size:.85rem;margin-bottom:3px'>"
+            f"Actual days to close: {actual_close}</div>{hbar(f'{actual_close}d', actual_close / mx * 100, BAD, height=20)}"
+            f"<div style='color:#334155;font-weight:600;font-size:.85rem;margin:8px 0 3px'>"
+            f"Benchmark days to close: {bench_close}</div>{hbar(f'{bench_close}d', bench_close / mx * 100, MUTE, height=20)}"
+            f"</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sect-h'>By stage vs benchmark</div>", unsafe_allow_html=True)
+        rows = list(vel.iterrows())
+        for i in range(0, len(rows), 2):
+            cc = st.columns(2)
+            for j, col in enumerate(cc):
+                if i + j >= len(rows):
+                    continue
+                _, r = rows[i + j]
+                faster = r["delta"] <= 0
+                dcol, arr = (GOOD, "▲") if faster else (BAD, "▼")
+                dtxt = f"{r['delta']:+.0f}d {'faster' if faster else 'slower'}"
+                col.markdown(
+                    f"<div style='background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 15px;"
+                    f"margin-bottom:8px'><div style='display:flex;justify-content:space-between;align-items:center'>"
+                    f"<span style='font-weight:800;color:{INK}'>{r['stage']}</span>{status_pill(r['status'])}</div>"
+                    f"<div style='margin-top:6px;color:#475569;font-size:.85rem'>{r['days']:.0f}d &nbsp;·&nbsp; "
+                    f"benchmark {r['benchmark']}d &nbsp; <span style='color:{dcol};font-weight:700'>{arr} {dtxt}</span>"
+                    f"</div></div>", unsafe_allow_html=True)
+        st.caption("Time-in-stage from HubSpot (avg over deals closed-won in the last 180 days). "
+                   "Benchmarks are configurable targets (proposal.py).")
+
+    def p_conversion():
+        grain = seg_toggle("conv_grain")
+        conv, window = load_conversion(today.isoformat(), grain)
+        decision_callout(
+            "Where is pipeline dropping?",
+            f"Stage-to-stage conversion vs benchmark · {grain.lower()} window ({window}).",
+            "Fix the stage with the biggest gap to benchmark first.")
+        for _, r in conv.iterrows():
+            rate, bench = r["rate"], r["benchmark"]
+            if rate is None or pd.isna(rate):
+                barcolor, pct, ratetxt = MUTE, 0, "N/A"
+            else:
+                ratetxt = f"{rate:.0f}%"
+                pct = rate
+                barcolor = GOOD if rate >= bench else ("#f59e0b" if rate >= bench * 0.7 else BAD)
+            proxy = "" if r["real"] else ("<div style='color:#94a3b8;font-size:.72rem;margin-top:1px'>"
+                                          "proxy — pending stage-entry history</div>")
+            st.markdown(
+                f"<div style='margin:12px 0'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+                f"<span style='font-weight:800;color:{INK};font-size:.95rem'>{r['transition']}</span>"
+                f"<span style='color:#64748b'><b style='color:{INK}'>{ratetxt}</b> vs {bench}% benchmark</span></div>"
+                f"<div style='margin-top:4px'>{hbar(ratetxt, pct, barcolor, height=24)}</div>{proxy}</div>",
+                unsafe_allow_html=True)
+        st.caption("SQL-H → SAL is measured directly from funnel counts. SAL → ROI → NEG → WIN use the "
+                   "current open-stage distribution + wins as a proxy until stage-entry history is backfilled.")
+
+    def p_product():
+        pp = pr["product"]
+        decision_callout(
+            "How is each product line performing? (overlapping use-case view)",
+            "AR = use case contains AR · AP = contains AP · Multi-Product = AR+AP, AR+Expense, "
+            "AR+Global Payroll, or AP+Global Payroll. A deal can count in more than one column.",
+            "Confirm whether AP and Multi-Product are scaling as growth engines beyond core AR.")
+        cols = P.PRODUCT_COLS
+        rows = [
+            ("SQL-Held", [f"{int(pp.loc[c, 'sql_held'])}" for c in cols]),
+            ("SAL", [f"{int(pp.loc[c, 'sal'])}" for c in cols]),
+            ("Pipeline ARR", [money(pp.loc[c, "pipeline_arr"]) for c in cols]),
+            ("Bookings ACV", [money(pp.loc[c, "bookings_acv"]) for c in cols]),
+            ("Wins", [f"{int(pp.loc[c, 'wins'])}" for c in cols]),
+            ("Avg ACV", [money(pp.loc[c, "avg_acv"]) for c in cols]),
+        ]
+        st.markdown(html_table(cols, rows, "Key metric"), unsafe_allow_html=True)
+        b = pp.reset_index()
+        b["Bookings $K"] = b["bookings_acv"] / 1e3
+        fig = px.bar(b, x="label", y="Bookings $K", color="label", title="Bookings ACV by product (QTD)",
+                     category_orders={"label": cols},
+                     color_discrete_map={"AR": "#1e40af", "AP": "#f59e0b", "Multi-Product": "#8b5cf6"})
+        fig.update_layout(height=300, showlegend=False, xaxis_title="")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Teampay is excluded by the app's base filter today; AR / AP / Multi-Product use the "
+                   "overlapping definition above.")
+
+    def p_diagnostics():
+        vel, _, _ = pr["velocity"]
+        ks = pr["keystats"]
+        slow = vel.sort_values("delta", ascending=False).iloc[0]
+        conv, _ = load_conversion(today.isoformat(), "Quarterly")
+        cgap = (conv.dropna(subset=["rate"]).assign(gap=lambda d: d["benchmark"] - d["rate"])
+                .sort_values("gap", ascending=False))
+        diag = []
+        if not cgap.empty and cgap.iloc[0]["gap"] > 0:
+            wc = cgap.iloc[0]
+            diag.append(f"Improve **{wc['transition']}** conversion — {wc['rate']:.0f}% vs "
+                        f"{wc['benchmark']}% benchmark.")
+        diag.append(f"Compress **{slow['stage']}** velocity — {slow['days']:.0f}d vs "
+                    f"{slow['benchmark']}d benchmark ({slow['delta']:+.0f}d).")
+        top_open = ks["open_arr"].idxmax()
+        diag.append(f"Convert **{top_open}** open pipeline — {money(ks.loc[top_open, 'open_arr'])} open, "
+                    f"{ks.loc[top_open, 'bookings_pct']:.0f}% of QTD bookings.")
+        for i, d in enumerate(diag[:3], 1):
+            st.markdown(
+                f"<div style='background:#fff;border:1px solid #e2e8f0;border-left:6px solid {NAVY};"
+                f"padding:14px 18px;border-radius:10px;margin-bottom:10px;font-size:1.02rem'>"
+                f"<span style='display:inline-block;width:26px;height:26px;background:{NAVY};color:#fff;"
+                f"border-radius:50%;text-align:center;line-height:26px;font-weight:800;margin-right:10px'>{i}</span>"
+                f"{_md_bold(d)}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sect-h'>Decisions &amp; owners</div>", unsafe_allow_html=True)
+        actions_section("TOF")
+
     SLIDES = [
-        {"id": "exec", "title": "Executive Summary", "hs": "pipeline",
-         "sub": "Will we create enough future revenue? Quarter-to-date health, pace and forecast.",
-         "render": s_exec},
-        {"id": "weekly", "title": "Weekly Performance", "hs": "funnel",
-         "sub": "What happened this week vs last week — by volume and by ERP.", "render": s_weekly},
-        {"id": "market", "title": "Market Performance", "hs": "funnel",
-         "sub": "Where growth is coming from — and where it's slowing.", "render": s_market},
-        {"id": "gtm", "title": "GTM Engine", "hs": "marketing",
-         "sub": "Which acquisition engine produces repeatable pipeline.", "render": s_gtm},
-        {"id": "product", "title": "Product & Product × Market", "hs": "pipeline",
-         "sub": "AR / AP / Multi-product mix, and where each product converts by market.",
-         "render": s_product},
-        {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
-         "sub": "The six weekly questions, answered with data.", "render": s_strategic},
-        {"id": "trends", "title": "Trends", "hs": "waterfall",
-         "sub": "Week-over-week funnel and bookings trajectory.", "render": s_trends},
-        {"id": "actions", "title": "Actions & Decisions",
-         "sub": "Decisions, owners, and follow-ups from today.", "render": s_actions},
+        {"id": "title", "title": "2026 Sales Plan", "render": p_title},
+        {"id": "section", "title": "TOF Slides", "render": p_section},
+        {"id": "exec", "title": "Executive Summary — AR Performance Q2 QTD",
+         "sub": "The six headline TOF metrics, attainment, and quarter-over-quarter trend.", "render": p_exec},
+        {"id": "bookings", "title": "Bookings Trending Over Time",
+         "sub": "Quarterly closed-won ARR by ERP ecosystem.", "render": p_bookings},
+        {"id": "keystats", "title": "Key Stats by ERP",
+         "sub": "Closed-won, avg ACV, logos, sales cycle, mix and open pipeline.", "render": p_keystats},
+        {"id": "wr_erp", "title": "Win Rates by ERP",
+         "sub": "Where are we winning — segment × ERP.", "render": p_winrate_erp},
+        {"id": "wr_gtm", "title": "Win Rates by GTM Engine",
+         "sub": "Which acquisition engine is producing bookings — segment × GTM.", "render": p_winrate_gtm},
+        {"id": "gtmperf", "title": "GTM Engine Performance",
+         "sub": "Pipeline ARR by engine, split by ERP.", "render": p_gtmperf},
+        {"id": "velocity", "title": "Pipeline Velocity — Time in Stage",
+         "sub": "How fast does pipeline move vs benchmark.", "render": p_velocity},
+        {"id": "conversion", "title": "Pipeline Conversion — Stage to Stage",
+         "sub": "Where pipeline is dropping vs benchmark.", "render": p_conversion},
+        {"id": "product", "title": "Performance by Product",
+         "sub": "AR / AP / Multi-Product (overlapping use-case view).", "render": p_product},
+        {"id": "diagnostics", "title": "Top of Funnel — 3 Diagnostics This Week",
+         "sub": "The three things to act on, with owners.", "render": p_diagnostics},
     ]
 
 # ===================== BOOKING REVIEW =====================
 else:
-    df = load_booking(today.isoformat())
+    df_full = load_booking(today.isoformat())
+    PRODUCT_OPTIONS = product_filter_options(df_full)
+    if st.session_state.get(_prod_key) not in PRODUCT_OPTIONS:
+        st.session_state[_prod_key] = "All"
+    _prod = current_product_filter()
+    df = df_full if (_prod == "All" or "product" not in df_full.columns) else df_full[df_full["product"] == _prod]
     roll = analytics.forecast_rollup(df)
+    # Forecast in BOTH currencies (ACV = AR+AP, ARR = recurring) so each can be read against its
+    # own plan. ACV historically overstated "% to plan" because it was compared to an ARR goal.
     weighted = roll["weighted_acv"].sum()
     commit = roll.loc[roll.forecast_cat == "Commit", "acv"].sum()
     best = roll.loc[roll.forecast_cat == "Best Case", "acv"].sum()
+    weighted_arr = roll["weighted_arr"].sum()
+    commit_arr = roll.loc[roll.forecast_cat == "Commit", "arr"].sum()
+    best_arr = roll.loc[roll.forecast_cat == "Best Case", "arr"].sum()
     plan = goal_sum("bookings_arr")
+    plan_acv = goal_sum("bookings_acv")
     win = analytics.forecast_windows(df, today)
-    snapshots.capture(today, {"bk_open_acv": df["acv"].sum(), "bk_commit": commit,
-                              "bk_best": best, "bk_weighted": weighted,
-                              "bk_q_total": win["Quarter"]["total"]})
+    # Snapshots / Forecast Movement must stay COMPANY-WIDE regardless of the active use-case filter,
+    # or the persistent snapshot store would capture filtered values and corrupt WoW deltas.
+    roll_full = analytics.forecast_rollup(df_full)
+    commit_full = roll_full.loc[roll_full.forecast_cat == "Commit", "acv"].sum()
+    best_full = roll_full.loc[roll_full.forecast_cat == "Best Case", "acv"].sum()
+    weighted_full = roll_full["weighted_acv"].sum()
+    win_full = analytics.forecast_windows(df_full, today)
+    snapshots.capture(today, {"bk_open_acv": df_full["acv"].sum(), "bk_commit": commit_full,
+                              "bk_best": best_full, "bk_weighted": weighted_full,
+                              "bk_q_total": win_full["Quarter"]["total"]})
 
     bookings_arr_qtd = float(base.loc[base["is_book"], "arr"].sum())
+    bookings_acv_qtd = float(base.loc[base["is_book"], "acv"].sum())
+    bookings_arr_qtd_full = float(base_full.loc[base_full["is_book"], "arr"].sum())
     open_arr = float(df["arr"].sum())
+    open_acv = float(df["acv"].sum())
     gap = max((plan or 0) - bookings_arr_qtd, 0.0)
     coverage = (open_arr / gap) if gap else None
     categorized = int(df["is_forecasted"].sum())
     commit_best_ct = int(df["forecast_cat"].isin(["Commit", "Best Case"]).sum())
     uncat_acv = float(df.loc[~df["is_forecasted"], "acv"].sum())
-    q_att = 100 * commit / plan if plan else None
+    # Apples-to-apples: ARR forecast vs ARR plan (primary), ACV forecast vs ACV plan (secondary).
+    q_att = 100 * commit_arr / plan if plan else None
+    q_att_acv = 100 * commit / plan_acv if plan_acv else None
     cov_ok = coverage is None or coverage >= 3
     cov_word = ("no goal set" if coverage is None else
                 ("healthy (≥3×)" if coverage >= 3 else "thin (<3×)"))
@@ -915,41 +1438,55 @@ else:
         # Slide 1 = forecast health in one frame (V2: "understand forecast health within the first
         # few minutes"). North-star strip, the W/M/Q forecast, then the decision. Gauges → expander.
         n = st.columns(4)
-        n[0].metric("Commit (Q)", money(commit), f"{q_att:.0f}% to plan" if q_att is not None else None,
+        n[0].metric("Commit (Q) · ARR", money(commit_arr),
+                    f"{q_att:.0f}% to plan" if q_att is not None else None,
                     delta_color="off", help=help_for("Commit"))
-        n[1].metric("Commit + Best", money(commit + best),
-                    f"{100*(commit+best)/plan:.0f}% to plan" if plan else None, delta_color="off",
+        n[0].caption(f"ACV {money(commit)}"
+                     + (f" · {q_att_acv:.0f}% to ACV plan" if q_att_acv is not None else ""))
+        n[1].metric("Commit + Best · ARR", money(commit_arr + best_arr),
+                    f"{100*(commit_arr+best_arr)/plan:.0f}% to plan" if plan else None, delta_color="off",
                     help=help_for("Commit", "Best Case"))
+        n[1].caption(f"ACV {money(commit + best)}"
+                     + (f" · {100*(commit+best)/plan_acv:.0f}% to ACV plan" if plan_acv else ""))
         n[2].metric("Pipeline coverage", "—" if coverage is None else f"{coverage:.1f}×",
                     cov_word, delta_color="off", help=help_for("Pipeline coverage"))
-        n[3].metric("Bookings QTD (ARR)", money(bookings_arr_qtd),
+        n[2].caption("open ARR ÷ gap to ARR plan")
+        n[3].metric("Bookings QTD · ARR", money(bookings_arr_qtd),
                     f"{100*bookings_arr_qtd/plan:.0f}% to plan" if plan else None, delta_color="off",
                     help=help_for("Bookings ARR", "QTD"))
+        n[3].caption(f"ACV {money(bookings_acv_qtd)}"
+                     + (f" · {100*bookings_acv_qtd/plan_acv:.0f}% to ACV plan" if plan_acv else ""))
         st.caption(pacing_line())
         decision_callout(
             "Will we hit the number?",
-            f"Commit {money(commit)}"
-            + (f" = {q_att:.0f}% of plan" if q_att is not None else "")
-            + f"; Commit+Best {money(commit + best)}; coverage {('—' if coverage is None else f'{coverage:.1f}×')} of the "
-            f"{money(gap)} gap; {categorized}/{len(df)} open deals carry a rep forecast category.",
+            f"Commit {money(commit_arr)} ARR / {money(commit)} ACV"
+            + (f" = {q_att:.0f}% of ARR plan" if q_att is not None else "")
+            + f"; Commit+Best {money(commit_arr + best_arr)} ARR; coverage "
+            f"{('—' if coverage is None else f'{coverage:.1f}×')} of the {money(gap)} ARR gap; "
+            f"{categorized}/{len(df)} open deals carry a rep forecast category.",
             ("Pressure-test Commit deals flagged for downgrade and pull Best Case upside forward."
              if (q_att is None or q_att < pace) else "On pace — protect Commit and convert Best Case.")
             + ("" if cov_ok else " Coverage is thin — accelerate pipeline creation / channel."))
         st.caption("Forecast categories come straight from HubSpot `hs_manual_forecast_category` (rep's call = "
-                   "source of truth). Open pipeline = deals beyond SQL stage still open. Each horizon = deals "
-                   "expected to close by that date.")
+                   "source of truth). Shown in ARR (matches the plan) with ACV alongside. Open pipeline = deals "
+                   "beyond SQL stage still open. Each horizon = deals expected to close by that date.")
 
-        st.markdown("**Forecast by horizon**")
+        st.markdown("**Forecast by horizon** (ARR; ACV in caption)")
         cols = st.columns(3)
         for i, name in enumerate(["Week", "Month", "Quarter"]):
             w = win[name]
-            att = 100 * w["commit"] / plan if (plan and name == "Quarter") else None
+            att = 100 * w["commit_arr"] / plan if (plan and name == "Quarter") else None
             with cols[i]:
                 st.markdown(f"**{name}** · by {w['end']:%b %d}")
-                st.metric("Commit", money(w["commit"]), f"{w['deals']} deals ≤ horizon",
+                st.metric("Commit · ARR", money(w["commit_arr"]), f"{w['deals']} deals ≤ horizon",
                           delta_color="off", help=help_for("Commit"))
-                st.caption(f"+ Best Case {money(w['best'])} · Total open {money(w['total'])}"
-                           + (f" · Commit {att:.0f}% of plan" if att else ""))
+                cap = (f"+ Best {money(w['best_arr'])} · Total open {money(w['total_arr'])} ARR "
+                       f"· Commit ACV {money(w['commit'])}")
+                if att:
+                    cap += f" · {att:.0f}% of plan"
+                if w.get("overdue"):
+                    cap += f" · ⚠ {w['overdue']} past-due"
+                st.caption(cap)
 
         disc_pct = 100 * categorized / len(df) if len(df) else 0
         disc_status = "Green" if disc_pct >= 70 else ("Yellow" if disc_pct >= 40 else "Red")
@@ -968,10 +1505,10 @@ else:
         with st.expander("Forecast detail — gauges vs plan & how it's computed", expanded=False):
             g = st.columns(4)
             for i, (lbl, val, ref) in enumerate([
-                    ("Commit (Q)", commit, plan or commit * 1.5),
-                    ("Commit + Best", commit + best, plan or (commit + best) * 1.3),
-                    ("Weighted (illustrative)", weighted, plan or weighted * 1.3),
-                    ("Total open (Q)", win["Quarter"]["total"], plan or win["Quarter"]["total"])]):
+                    ("Commit (Q) · ARR", commit_arr, plan or commit_arr * 1.5),
+                    ("Commit + Best · ARR", commit_arr + best_arr, plan or (commit_arr + best_arr) * 1.3),
+                    ("Weighted · ARR", weighted_arr, plan or weighted_arr * 1.3),
+                    ("Total open (Q) · ARR", win["Quarter"]["total_arr"], plan or win["Quarter"]["total_arr"])]):
                 fig = go.Figure(go.Indicator(
                     mode="gauge+number", value=val, number={"prefix": "$", "valueformat": ".2s"},
                     title={"text": lbl, "font": {"size": 12}},
@@ -980,7 +1517,8 @@ else:
                 fig.update_layout(height=190, margin=dict(t=36, b=8, l=18, r=18))
                 g[i].plotly_chart(fig, use_container_width=True)
             st.caption(f"Red line = Bookings ARR plan ({money(plan) if plan else 'set in sidebar'}). "
-                       "Weighted = Σ (Deal ACV × stage probability) per the AE Forecast-Hygiene standard.")
+                       "Gauges are ARR (matches the plan). Weighted = Σ (Deal ARR × stage probability) "
+                       "per the AE Forecast-Hygiene standard.")
             st.markdown("**Deal probability by stage (AE Forecast-Hygiene standard)** — system-assigned by "
                         "stage, not entered by reps:")
             st.dataframe(pd.DataFrame([
@@ -994,27 +1532,33 @@ else:
                 {"Deal stage": "Closed Won", "Probability": "100%", "Allowed forecast category": "Closed Won"},
             ]), use_container_width=True, hide_index=True)
             st.markdown(
-                "- **Weighted** = Σ (Deal ACV × stage probability above) — the documented hygiene formula.\n"
-                "- **Commit** = Σ ACV where the rep's HubSpot category = `COMMIT` (only valid at Negotiation).\n"
-                "- **Best Case** = Σ ACV where category = `BEST_CASE` (valid at Proposal/Negotiation).\n"
-                "- **Week / Month / Quarter** = the above, restricted to deals with `closedate` ≤ horizon end.\n"
-                "- **Pipeline coverage** = open pipeline ARR ÷ remaining gap to plan.\n"
+                "- **Currency:** every forecast figure is shown in **ARR** (matches the company plan) with "
+                "**ACV** (AR + AP) alongside. ARR = `property_arr`; ACV = `property_total_ar_ap_acv`.\n"
+                "- **Weighted** = Σ (Deal $ × stage probability above) — the documented hygiene formula.\n"
+                "- **Commit** = Σ $ where the rep's HubSpot category = `COMMIT` (only valid at Negotiation).\n"
+                "- **Best Case** = Σ $ where category = `BEST_CASE` (valid at Proposal/Negotiation).\n"
+                "- **Week / Month / Quarter** = the above, restricted to deals with `closedate` ≤ horizon end. "
+                "Deals already past their close date but still open are counted and surfaced as **past-due**.\n"
+                "- **Pipeline coverage** = open pipeline ARR ÷ remaining gap to ARR plan.\n"
                 "- The watchlist flags **'Category ahead of stage'** when a rep's category is more optimistic "
-                "than the stage allows (e.g. Commit at Proposal), and recommends aligning it.\n\n"
-                "*Confirm with Marcelo: Commit in ACV or ARR? Horizon on `closedate` or a forecast date?*")
+                "than the stage allows (e.g. Commit at Proposal), and recommends aligning it.")
         how_to_read(["Commit", "Best Case", "Pipeline coverage", "Weighted", "Forecast discipline",
                      "Bookings ARR", "ARR vs ACV", "RAG", "MEDDPICC", "Quarter elapsed"])
 
     def s_movement():
+        # WoW movement is company-wide (snapshots are company-wide), so compare against the full
+        # (unfiltered) current values — not the use-case-filtered ones.
         pd_date, prior = snapshots.prior_week(today)
         mv = []
         book_old = prior.get("tof_bookings_arr") if prior else None
         if book_old is not None:
-            d = bookings_arr_qtd - book_old
-            mv.append({"Metric": "Bookings ARR (QTD)", "Last week": money(book_old), "Now": money(bookings_arr_qtd),
+            d = bookings_arr_qtd_full - book_old
+            mv.append({"Metric": "Bookings ARR (QTD)", "Last week": money(book_old),
+                       "Now": money(bookings_arr_qtd_full),
                        "Δ": f"{'+' if d >= 0 else ''}{money(d)}"})
-        for key, lbl, cur in [("bk_commit", "Commit", commit), ("bk_best", "Best Case", best),
-                              ("bk_weighted", "Weighted", weighted), ("bk_q_total", "Total open (Q)", win["Quarter"]["total"])]:
+        for key, lbl, cur in [("bk_commit", "Commit", commit_full), ("bk_best", "Best Case", best_full),
+                              ("bk_weighted", "Weighted", weighted_full),
+                              ("bk_q_total", "Total open (Q)", win_full["Quarter"]["total"])]:
             old = prior.get(key) if prior else None
             delta = cur - old if old is not None else None
             mv.append({"Metric": lbl, "Last week": money(old) if old is not None else "— (accrues fwd)",
@@ -1217,6 +1761,13 @@ else:
 present = mode.startswith("Present")
 inject_deck_css(present)
 total = len(SLIDES)
+# Slides whose data is inherently company-wide (weekly flow counts, reconstructed trends, and
+# WoW movement off company-wide snapshots) — the use-case filter doesn't apply, so we hide it
+# there to avoid implying those numbers changed.
+NON_FILTERABLE = {"weekly", "trends", "movement",
+                  # Proposal TOF deck slides compute from proposal.py over the full population.
+                  "title", "section", "exec", "bookings", "keystats", "wr_erp", "wr_gtm", "gtmperf",
+                  "velocity", "conversion", "product", "diagnostics"}
 
 if present:
     # Single source of truth for the current slide. The dropdown is bound to this same
@@ -1245,30 +1796,16 @@ if present:
 
     slide = SLIDES[idx]
     slide_header(idx + 1, total, slide["title"], slide.get("sub", ""))
+    if slide["id"] not in NON_FILTERABLE:
+        render_product_filter(PRODUCT_OPTIONS)
     slide["render"]()
-    if slide.get("hs"):
-        hs_link(slide["hs"])
-    if slide["id"] != "title":
-        talking_points(slide["id"])
-
-    # Bottom nav for convenience on long slides.
-    st.write("")
-    bn = st.columns([1.2, 5, 1.2])
-    bn[0].button("◀  Prev", use_container_width=True, disabled=(idx == 0),
-                 key="nav_prev_b", on_click=_go, args=(-1,))
-    bn[1].markdown(f"<div style='text-align:center;color:#64748b'>Slide {idx + 1} of {total}</div>",
-                   unsafe_allow_html=True)
-    bn[2].button("Next  ▶", use_container_width=True, disabled=(idx == total - 1),
-                 key="nav_next_b", on_click=_go, args=(1,))
-    st.markdown(
-        f"<div style='text-align:center;color:#94a3b8;font-size:0.78rem;margin-top:6px'>"
-        f"Paystand · {meeting} · {pacing['quarter_label']} · Confidential · "
-        f"data from HubSpot, updated {pacing['today']:%b %d %Y}</div>",
-        unsafe_allow_html=True)
+    # Blue rule + Paystand logo at the bottom of every slide (focus the eye / mark the end).
+    slide_footer()
 else:
     st.markdown(f"## {meeting} · {pacing['quarter_label']}")
     st.caption(f"*{core_q}*  ·  {pacing['days_remaining']} days remaining  ·  "
                f"updated {pacing['today']:%A, %b %d %Y}")
+    render_product_filter(PRODUCT_OPTIONS)
     for i, slide in enumerate([s for s in SLIDES if s["id"] != "title"], start=1):
         st.markdown(f"### {i}. {slide['title']}")
         slide["render"]()

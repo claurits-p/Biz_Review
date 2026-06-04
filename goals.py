@@ -10,7 +10,7 @@ Goal grain: quarter x market x metric. Metrics: sql_booked, sql_held, sal, pipel
 import json, os
 
 _STORE = os.path.join(os.path.dirname(__file__), "goals_store.json")
-METRICS = ["sql_booked", "sql_held", "sal", "pipeline_arr", "bookings_arr"]
+METRICS = ["sql_booked", "sql_held", "sal", "pipeline_arr", "bookings_arr", "bookings_acv"]
 
 
 def _load() -> dict:

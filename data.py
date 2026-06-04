@@ -23,6 +23,11 @@ TEST_DEALS = ("Cloudera - New Deal", "TRX -  New Deal (Test)",
 BASE_FILTER = f"""
   d.deal_pipeline_id = '{SALES_PIPELINE_ID}'
   AND d.property_dealname NOT IN {TEST_DEALS}
+  -- Canonical scope (per RevOps definitions): the SQL source team must be KNOWN. The source team
+  -- lives in property_sql_generated_by (Marketing / BDR / Channels / AE / CS); null/blank = not a
+  -- properly-sourced SQL, so it's excluded from every funnel/forecast metric.
+  AND d.property_sql_generated_by IS NOT NULL
+  AND TRIM(d.property_sql_generated_by) != ''
   AND LOWER(IFNULL(d.property_hs_object_source_detail_1,'')) NOT LIKE '%teampay%'
   AND LOWER(IFNULL(d.property_hs_object_source_detail_1,'')) NOT LIKE '%tp data%'
   -- Machine-generated sources (INTEGRATION = sync dump, IMPORT = bulk migrations/renewals,
