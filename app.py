@@ -1689,6 +1689,67 @@ else:
                    f"the deal is Gong-linked ({gong_cov}/{len(df)} open deals; linkage is partial). "
                    "Recommended category is rule-based, from forecast-hygiene + MEDDPICC + activity risk.")
 
+    def s_pace():
+        # The bookings-for-the-quarter pace curve: cumulative Bookings ARR QTD vs prior quarter and
+        # the trailing-4-quarter average pace at the same day-of-quarter, plus a run-rate forecast.
+        # Pace history is company-wide (BASE_FILTER), so the actual line is company-wide too.
+        decision_callout(
+            "Are we tracking to the bookings number?",
+            "Cumulative Bookings ARR quarter-to-date vs the prior quarter and the trailing "
+            "4-quarter average pace at the same day, with a run-rate forecast to quarter-end.",
+            "If we're tracking below prior-quarter pace, pull Best Case upside forward now.")
+        q = (today.month - 1) // 3
+        qs = pacing["quarter_start"]
+        qs_ts = pd.Timestamp(qs)
+        q_end = dt.date(today.year + (q == 3), ((q + 1) % 4) * 3 + 1, 1) - dt.timedelta(days=1)
+        days = pd.date_range(qs_ts, pd.Timestamp(today))
+        day_in_q = pacing["days_in_quarter"]
+        today_doq = max(pacing["days_into_quarter"], 1)
+        full_dates = pd.date_range(qs_ts, periods=day_in_q)
+        s = base_full[base_full["is_book"]].copy()
+        s["d"] = pd.to_datetime(s["close_d"])
+        daily = s.groupby(s["d"].dt.normalize())["arr"].sum()
+        cum = daily.reindex(days, fill_value=0).cumsum()
+        goal = goal_sum("bookings_arr")
+
+        fig = go.Figure()
+        ph = load_pace_history(today.isoformat())
+        curves = analytics.quarter_pace_curves(ph, "bookings_arr", today, day_in_q)
+        if curves.get("avg4") is not None:
+            fig.add_trace(go.Scatter(x=full_dates, y=curves["avg4"].values, mode="lines",
+                                     name="Last-4-qtr avg pace", line={"color": "#c7d2fe", "width": 2}))
+        if curves.get("prior") is not None:
+            fig.add_trace(go.Scatter(x=full_dates, y=curves["prior"].values, mode="lines",
+                                     name="Prior quarter", line={"color": "#94a3b8", "width": 2, "dash": "dot"}))
+        fig.add_trace(go.Scatter(x=cum.index, y=cum.values, mode="lines", name="Actual (QTD)",
+                                 line={"color": PRIMARY, "width": 3}, fill="tozeroy"))
+        cum_today = float(cum.iloc[-1]) if len(cum) else 0.0
+        fc_dates = full_dates[today_doq - 1:]
+        fc_y = [cum_today * (i + 1) / today_doq for i in range(today_doq - 1, day_in_q)]
+        fig.add_trace(go.Scatter(x=fc_dates, y=fc_y, mode="lines", name="Run-rate forecast",
+                                 line={"color": PRIMARY, "width": 2, "dash": "dash"}))
+        if goal:
+            total_days = (q_end - qs).days or 1
+            tgt_x = pd.date_range(qs_ts, pd.Timestamp(q_end))
+            tgt_y = [goal * i / total_days for i in range(len(tgt_x))]
+            fig.add_trace(go.Scatter(x=tgt_x, y=tgt_y, mode="lines", name="Plan (linear)",
+                                     line={"color": "#16a34a", "dash": "dash"}))
+        fig.add_vline(x=pd.Timestamp(today), line_dash="dot", line_color="#cbd5e1")
+        fig.update_layout(title="Bookings ARR: QTD pace vs prior quarter, 4-qtr avg & forecast",
+                          height=380, yaxis_title="Cumulative Bookings ARR ($)", margin=dict(t=44, b=10),
+                          legend={"orientation": "h"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        proj = cum_today / (pace / 100) if pace else cum_today
+        ref = ""
+        if curves.get("prior") is not None and len(curves["prior"]) >= today_doq:
+            prior_at_day = float(curves["prior"].iloc[today_doq - 1])
+            if prior_at_day:
+                ref = (f" That's **{(cum_today / prior_at_day - 1) * 100:+.0f}%** vs the prior quarter at "
+                       f"the same day ({money(prior_at_day)}).")
+        st.caption(f"Run-rate forecast ≈ **{money(proj)}** by quarter-end if today's pace holds." + ref +
+                   ("" if goal else " Add a Bookings ARR goal in the sidebar to overlay the plan line."))
+
     def s_actions():
         actions_section("Booking")
 
@@ -1735,6 +1796,9 @@ else:
         {"id": "exec", "title": "Executive Forecast", "hs": "pods",
          "sub": "Will we hit the number? Week / Month / Quarter forecast, coverage and discipline.",
          "render": s_exec},
+        {"id": "pace", "title": "Bookings Pace", "hs": "pipeline",
+         "sub": "QTD bookings vs prior quarter, the 4-quarter average pace, and run-rate forecast.",
+         "render": s_pace},
         {"id": "movement", "title": "Forecast Movement", "hs": "waterfall",
          "sub": "What changed in the forecast week-over-week.", "render": s_movement},
         {"id": "market", "title": "Market Forecast View", "hs": "funnel",
@@ -1764,7 +1828,7 @@ total = len(SLIDES)
 # Slides whose data is inherently company-wide (weekly flow counts, reconstructed trends, and
 # WoW movement off company-wide snapshots) — the use-case filter doesn't apply, so we hide it
 # there to avoid implying those numbers changed.
-NON_FILTERABLE = {"weekly", "trends", "movement",
+NON_FILTERABLE = {"weekly", "trends", "movement", "pace",
                   # Proposal TOF deck slides compute from proposal.py over the full population.
                   "title", "section", "exec", "bookings", "keystats", "wr_erp", "wr_gtm", "gtmperf",
                   "velocity", "conversion", "product", "diagnostics"}
