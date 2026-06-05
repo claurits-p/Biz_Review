@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import pandas as pd
 from data import _q, BASE_FILTER, DEAL
+from definitions import FORECAST_CATEGORY_MAP
 
 # This deck is "AR Performance": every slide up to the Product slide is scoped to deals whose
 # use case CONTAINS "AR" (so Multi-Product like AR+AP counts; AP-only is excluded). The Product
@@ -401,4 +402,114 @@ def product_performance(today: dt.date) -> pd.DataFrame:
     GROUP BY label"""
     df = _q(sql).set_index("label").reindex(PRODUCT_COLS).fillna(0)
     df["avg_acv"] = (df["bookings_acv"] / df["wins"].replace(0, pd.NA)).fillna(0)
+    return df
+
+
+# ===========================================================================================
+# BOOKINGS DECK (boss's slides 15–21). AR-scoped, ERP-bucketed, forecast categories straight
+# from HubSpot hs_manual_forecast_category (the rep's call = source of truth).
+# ===========================================================================================
+FCAT_ORDER = ["Pipeline", "Commit", "Best Case"]
+
+
+def _horizon_ends(today: dt.date) -> dict:
+    """Week / Month / Quarter close-by dates, matching the core app's forecast horizons."""
+    week_end = today + dt.timedelta(days=(6 - today.weekday()))
+    month_end = (dt.date(today.year + (today.month == 12), (today.month % 12) + 1, 1)
+                 - dt.timedelta(days=1))
+    q = (today.month - 1) // 3
+    qend_m = q * 3 + 3
+    q_end = (dt.date(today.year + (qend_m == 12), (qend_m % 12) + 1, 1) - dt.timedelta(days=1))
+    return {"Week": week_end, "Month": month_end, "Quarter": q_end}
+
+
+def _ar_open_deals(today: dt.date) -> pd.DataFrame:
+    """AR-scoped open Sales-Pipeline deals with ERP, forecast category, ARR and close date."""
+    op = _q(f"""
+        SELECT {ERP5_CASE} erp, d.property_hs_manual_forecast_category fcat,
+               DATE(d.property_closedate) close_d, SAFE_CAST(d.property_arr AS FLOAT64) arr
+        FROM {DEAL} d WHERE {SCOPED} AND d.property_hs_is_closed = FALSE
+          AND d.deal_pipeline_stage_id IN {OPEN_STAGE_IDS}""")
+    if op.empty:
+        op = pd.DataFrame(columns=["erp", "fcat", "close_d", "arr"])
+    op["cat"] = op["fcat"].map(lambda x: FORECAST_CATEGORY_MAP.get(x, "Not Forecasted"))
+    op["close_d"] = pd.to_datetime(op["close_d"], errors="coerce")
+    op["arr"] = pd.to_numeric(op["arr"], errors="coerce").fillna(0.0)
+    return op
+
+
+def ar_forecast_by_erp(today: dt.date) -> dict:
+    """Per-horizon ERP matrix: Closed-Won (QTD), Pipeline, Commit, Best Case ARR by ERP.
+
+    Returns {'Week': df, 'Month': df, 'Quarter': df} where each df is indexed by ERP5 with
+    columns closed_won / Pipeline / Commit / Best Case (open deals whose closedate ≤ horizon end).
+    """
+    qs = quarter_start_of(today)
+    won = _q(f"""SELECT {ERP5_CASE} erp, ROUND(SUM(SAFE_CAST(d.property_arr AS FLOAT64))) won_arr
+        FROM {DEAL} d WHERE {SCOPED} AND d.property_hs_is_closed_won = TRUE
+          AND DATE(d.property_closedate) BETWEEN '{qs.isoformat()}' AND '{today.isoformat()}'
+        GROUP BY erp""").set_index("erp")["won_arr"].reindex(ERP5_ORDER).fillna(0.0)
+    op = _ar_open_deals(today)
+    horizons = {}
+    for hname, hend in _horizon_ends(today).items():
+        sub = op[op["close_d"] <= pd.Timestamp(hend)]
+        piv = sub.pivot_table(index="erp", columns="cat", values="arr", aggfunc="sum", fill_value=0)
+        df = pd.DataFrame(index=ERP5_ORDER)
+        df["closed_won"] = won
+        for c in FCAT_ORDER:
+            df[c] = piv[c].reindex(ERP5_ORDER).fillna(0.0) if c in piv.columns else 0.0
+        horizons[hname] = df.fillna(0.0)
+    return horizons
+
+
+def forecast_totals(today: dt.date) -> dict:
+    """AR-scoped current forecast totals (company-wide within AR): Bookings ARR (QTD won),
+    Not Forecasted, Pipeline, Commit, Best Case open ARR. WoW is computed in the app via snapshots."""
+    qs = quarter_start_of(today)
+    won = _q(f"""SELECT ROUND(SUM(SAFE_CAST(d.property_arr AS FLOAT64))) v FROM {DEAL} d
+        WHERE {SCOPED} AND d.property_hs_is_closed_won = TRUE
+          AND DATE(d.property_closedate) BETWEEN '{qs.isoformat()}' AND '{today.isoformat()}'
+        """).iloc[0]["v"] or 0
+    op = _ar_open_deals(today)
+    g = op.groupby("cat")["arr"].sum()
+    return {"bookings_arr": float(won), "not_forecasted": float(g.get("Not Forecasted", 0.0)),
+            "pipeline": float(g.get("Pipeline", 0.0)), "commit": float(g.get("Commit", 0.0)),
+            "best_case": float(g.get("Best Case", 0.0))}
+
+
+# Lost-reason bucketing. property_closed_lost_reason is multi-token (";"-joined); classify by
+# precedence so each lost deal lands in exactly one bucket.
+LOST_BUCKETS = ["Competitive Direct", "Price", "Product Features",
+                "Budget - No Active Project", "Timing", "Unresponsive + Other"]
+_LOST_CASE = """
+  CASE
+    WHEN UPPER(r) LIKE '%COMPETITION%'                                              THEN 'Competitive Direct'
+    WHEN UPPER(r) LIKE '%PRICE%' OR UPPER(r) LIKE '%PRICING%' OR UPPER(r) LIKE '%RATE MATCHING%' THEN 'Price'
+    WHEN UPPER(r) LIKE '%FEATUREGAP%' OR UPPER(r) LIKE '%SOLUTION MISMATCH%' OR UPPER(r) LIKE '%INTEGRATE%' THEN 'Product Features'
+    WHEN UPPER(r) LIKE '%NO ACTIVE PROJECT%' OR UPPER(r) LIKE '%LACK OF BUSINESS%'   THEN 'Budget - No Active Project'
+    WHEN UPPER(r) LIKE '%TIMING%'                                                   THEN 'Timing'
+    ELSE 'Unresponsive + Other'
+  END"""
+
+
+def lost_deals(today: dt.date, erp: str | None = None) -> pd.DataFrame:
+    """AR-scoped closed-lost deals THIS QUARTER, grouped into 6 reason buckets.
+    Optional `erp` restricts to a single ERP (NetSuite / Sage / …). Returns a DataFrame indexed
+    by bucket with deals, lost_arr, pct (of lost $), avg_arr."""
+    qs = quarter_start_of(today)
+    erp_filter = f" AND {ERP5_CASE} = '{erp}'" if erp else ""
+    sql = f"""
+    WITH d AS (
+      SELECT IFNULL(d.property_closed_lost_reason,'') r, SAFE_CAST(d.property_arr AS FLOAT64) arr
+      FROM {DEAL} d WHERE {SCOPED} AND d.property_hs_is_closed_lost = TRUE{erp_filter}
+        AND DATE(d.property_closedate) BETWEEN '{qs.isoformat()}' AND '{today.isoformat()}')
+    SELECT {_LOST_CASE} bucket, COUNT(*) deals, ROUND(SUM(arr)) lost_arr
+    FROM d GROUP BY bucket"""
+    df = _q(sql).set_index("bucket").reindex(LOST_BUCKETS).fillna(0.0)
+    total_arr = df["lost_arr"].sum() or 1.0
+    total_deals = int(df["deals"].sum())
+    df["pct"] = (df["lost_arr"] / total_arr * 100).round(0)
+    df["avg_arr"] = (df["lost_arr"] / df["deals"].replace(0, pd.NA)).fillna(0.0)
+    df.attrs["total_deals"] = total_deals
+    df.attrs["total_arr"] = float(df["lost_arr"].sum())
     return df

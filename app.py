@@ -218,6 +218,22 @@ def load_conversion(today_iso: str, grain: str):
     return P.stage_conversion(dt.date.fromisoformat(today_iso), grain)
 
 
+@st.cache_data(ttl=3600)
+def load_bk_forecast(today_iso: str):
+    return P.ar_forecast_by_erp(dt.date.fromisoformat(today_iso))
+
+
+@st.cache_data(ttl=3600)
+def load_bk_totals(today_iso: str):
+    return P.forecast_totals(dt.date.fromisoformat(today_iso))
+
+
+@st.cache_data(ttl=3600)
+def load_lost(today_iso: str, erp):
+    df = P.lost_deals(dt.date.fromisoformat(today_iso), erp)
+    return df, int(df.attrs.get("total_deals", 0)), float(df.attrs.get("total_arr", 0.0))
+
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.markdown("### Paystand Business Review")
@@ -570,6 +586,51 @@ def seg_toggle(key, options=("Weekly", "Monthly", "Quarterly"), default_index=2)
             st.session_state[key] = opt
             st.rerun()
     return st.session_state[key]
+
+
+def html_table(columns, rows, first_col="Metric", align_first="left"):
+    """Compact styled table: navy header, zebra rows, right-aligned numeric cells."""
+    head = f"<th style='padding:9px 14px;text-align:{align_first}'>{first_col}</th>" + "".join(
+        f"<th style='padding:9px 14px;text-align:right;font-weight:700'>{c}</th>" for c in columns)
+    body = ""
+    for i, (lbl, cells) in enumerate(rows):
+        bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        tds = "".join(f"<td style='padding:9px 14px;text-align:right;color:#0f172a'>{c}</td>" for c in cells)
+        body += (f"<tr style='background:{bg}'><td style='padding:9px 14px;font-weight:700;"
+                 f"color:#334155'>{lbl}</td>{tds}</tr>")
+    return (f"<table style='width:100%;border-collapse:collapse;font-size:.88rem;border:1px solid "
+            f"#e2e8f0;border-radius:10px;overflow:hidden'><thead><tr style='background:{NAVY};"
+            f"color:#fff'>{head}</tr></thead><tbody>{body}</tbody></table>")
+
+
+def section_divider(label, subtitle=""):
+    """Full-slide navy section divider (e.g. 'TOF Slides', 'Bookings')."""
+    st.markdown(
+        f"<div style='text-align:center;padding:110px 0'>"
+        f"<div style='display:inline-block;background:{NAVY};color:#fff;padding:20px 56px;border-radius:16px;"
+        f"font-size:2.4rem;font-weight:800;letter-spacing:.02em'>{label}</div>"
+        + (f"<div style='color:#64748b;margin-top:18px;font-size:1.05rem'>{subtitle}</div>" if subtitle else "")
+        + "</div>", unsafe_allow_html=True)
+
+
+def kpi_card_html(label, value, att=None, wow=None, accent=None, width="340px"):
+    """Exec-style KPI card: big number, attainment, coloured WoW. Used across the decks."""
+    accent = accent or NAVY
+    att_html = (f"<span style='color:#1e40af;font-weight:800'>{att:.0f}%</span>"
+                f"<span style='color:#94a3b8;font-size:.72rem'> att.</span>" if att is not None
+                else "<span style='color:#94a3b8;font-size:.78rem'>no goal set</span>")
+    wow_html = ""
+    if wow is not None:
+        c = GOOD if wow >= 0 else BAD
+        arr = "▲" if wow >= 0 else "▼"
+        wow_html = (f"&nbsp;&nbsp;<span style='color:{c};font-weight:800'>{arr} {wow:+.0f}%</span>"
+                    f"<span style='color:#94a3b8;font-size:.72rem'> WoW</span>")
+    return (f"<div style='background:#fff;border:1px solid #e2e8f0;border-top:4px solid {accent};"
+            f"border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(15,23,42,.06);max-width:{width}'>"
+            f"<div style='color:#64748b;font-weight:700;font-size:.78rem;text-transform:uppercase;"
+            f"letter-spacing:.05em'>{label}</div>"
+            f"<div style='font-size:2.05rem;font-weight:800;color:{INK};line-height:1.05;margin:3px 0 5px'>{value}</div>"
+            f"<div style='font-size:.82rem'>{att_html}{wow_html}</div></div>")
 
 
 def talking_points(slide_id):
@@ -1416,6 +1477,12 @@ else:
     snapshots.capture(today, {"bk_open_acv": df_full["acv"].sum(), "bk_commit": commit_full,
                               "bk_best": best_full, "bk_weighted": weighted_full,
                               "bk_q_total": win_full["Quarter"]["total"]})
+    # AR-scoped forecast snapshot (powers the boss's AR Forecast Movement slide week-over-week).
+    _ar_tot = load_bk_totals(today.isoformat())
+    snapshots.capture(today, {"ar_bookings_arr": _ar_tot["bookings_arr"],
+                              "ar_not_forecasted": _ar_tot["not_forecasted"],
+                              "ar_pipeline": _ar_tot["pipeline"], "ar_commit": _ar_tot["commit"],
+                              "ar_best": _ar_tot["best_case"]})
 
     bookings_arr_qtd = float(base.loc[base["is_book"], "arr"].sum())
     bookings_acv_qtd = float(base.loc[base["is_book"], "acv"].sum())
@@ -1753,6 +1820,156 @@ else:
     def s_actions():
         actions_section("Booking")
 
+    # ---- Boss's Bookings deck (proposal slides 14–21), AR-scoped & ERP-bucketed ----
+    def s_booking_divider():
+        section_divider("Bookings", f"AR forecast & bookings · {pacing['quarter_label']}")
+
+    def s_ar_forecast():
+        decision_callout(
+            "Will we hit the number? (AR)",
+            "QTD AR forecast by ERP — Closed Won, Pipeline, Commit and Best Case for open deals "
+            "closing by the selected horizon. Forecast category = the rep's HubSpot call.",
+            "Pressure-test Commit; pull Best Case forward where coverage is thin.")
+        tot = load_bk_totals(today.isoformat())
+        att = company_attainment("bookings_arr")[0]
+        _, prior_snap = snapshots.prior_week(today)
+        prev = prior_snap.get("ar_bookings_arr") if prior_snap else None
+        wow = (100 * (tot["bookings_arr"] - prev) / prev) if prev else None
+        st.markdown(kpi_card_html("ARR Bookings · QTD", money(tot["bookings_arr"]), att, wow),
+                    unsafe_allow_html=True)
+        st.write("")
+        horizon = seg_toggle("bk_fc_h", ("Week", "Month", "Quarter"), default_index=2)
+        fc = load_bk_forecast(today.isoformat())[horizon]
+        erps = P.ERP5_ORDER
+        cb = fc["Commit"] + fc["Best Case"]
+
+        def r(metric, series):
+            return (metric, [money(series.loc[e]) for e in erps] + [money(series.sum())])
+        rows = [r("Closed Won", fc["closed_won"]), r("Pipeline", fc["Pipeline"]),
+                r("Commit", fc["Commit"]), r("Best Case", fc["Best Case"]),
+                r("Commit + Best Case", cb)]
+        st.markdown(html_table(erps + ["Total"], rows, f"Forecast · ARR ({horizon})"),
+                    unsafe_allow_html=True)
+        st.caption("Closed Won = won ARR QTD. Pipeline / Commit / Best Case = open deals whose close "
+                   f"date is on or before the end of the {horizon.lower()}, by the rep's forecast category. "
+                   "'Other' includes Paystand X / broad-market ERPs.")
+
+    def s_fc_movement():
+        decision_callout(
+            "What changed in the forecast this week? (AR)",
+            "Week-over-week movement in AR bookings and the open forecast categories for the quarter.",
+            "Investigate large negative swings in Commit / Best Case before the call.")
+        cur = load_bk_totals(today.isoformat())
+        _, prior_snap = snapshots.prior_week(today)
+        specs = [("Bookings $ — ARR (QTD)", "ar_bookings_arr", "bookings_arr"),
+                 ("Not Forecasted", "ar_not_forecasted", "not_forecasted"),
+                 ("Pipeline", "ar_pipeline", "pipeline"),
+                 ("Commit", "ar_commit", "commit"),
+                 ("Best Case", "ar_best", "best_case")]
+        rows = []
+        for lbl, skey, ckey in specs:
+            now = cur[ckey]
+            old = prior_snap.get(skey) if prior_snap else None
+            if old is None:
+                last, var = "— (accrues fwd)", "—"
+            else:
+                last = money(old)
+                d = now - old
+                c = GOOD if d >= 0 else BAD
+                arr = "▲" if d >= 0 else "▼"
+                var = f"<span style='color:{c};font-weight:700'>{arr} {money(d)}</span>"
+            rows.append((lbl, [last, money(now), var]))
+        st.markdown(html_table(["Last week", "Now", "Δ variance"], rows, "Metric"),
+                    unsafe_allow_html=True)
+        st.caption("AR-scoped (use case contains AR). Deltas accrue from the first weekly snapshot; "
+                   "'— (accrues fwd)' means there's no prior-week snapshot yet.")
+
+    def _lost_slide(erp=None):
+        df, total_deals, total_arr = load_lost(today.isoformat(), erp)
+        scope = erp or "All ERPs"
+        decision_callout(
+            f"Where are we losing this quarter? ({scope})",
+            "Closed-lost AR deals this quarter bucketed by primary loss reason — share of lost ARR, "
+            "deal count and average deal size.",
+            "Attack the biggest loss driver: coach reps and tune positioning / pricing.")
+        if total_deals == 0:
+            st.info(f"No closed-lost AR deals this quarter for {scope}.")
+            return
+        cards = []
+        for b in P.LOST_BUCKETS:
+            rr = df.loc[b]
+            pct = float(rr["pct"])
+            col = BAD if pct >= 20 else ("#b45309" if pct >= 10 else "#64748b")
+            cards.append(
+                f"<div style='background:#fff;border:1px solid #e2e8f0;border-left:6px solid {col};"
+                f"border-radius:10px;padding:12px 16px;height:118px'>"
+                f"<div style='color:#334155;font-weight:800;font-size:.82rem;text-transform:uppercase;"
+                f"letter-spacing:.03em'>{b}</div>"
+                f"<div style='font-size:1.9rem;font-weight:800;color:{col};line-height:1.1;margin:2px 0'>"
+                f"{pct:.0f}%</div>"
+                f"<div style='color:#64748b;font-size:.82rem'>{money(rr['lost_arr'])} &nbsp;·&nbsp; "
+                f"{int(rr['deals'])} deals &nbsp;·&nbsp; avg {money(rr['avg_arr'])}</div></div>")
+        for i in range(0, len(cards), 3):
+            cc = st.columns(3)
+            for j, c in enumerate(cc):
+                if i + j < len(cards):
+                    c.markdown(cards[i + j], unsafe_allow_html=True)
+        top = df.sort_values("lost_arr", ascending=False).iloc[0]
+        st.markdown(
+            f"<div style='background:#fff;border:1px solid #e2e8f0;border-left:6px solid {NAVY};"
+            f"padding:12px 16px;border-radius:10px;margin-top:12px'><b>Insights:</b> largest loss "
+            f"driver is <b>{top.name}</b> — {top['pct']:.0f}% of lost ARR "
+            f"({money(top['lost_arr'])} across {int(top['deals'])} deals). "
+            f"{total_deals} lost deals · {money(total_arr)} total lost ARR this quarter.</div>",
+            unsafe_allow_html=True)
+
+    def s_lost_all():
+        _lost_slide(None)
+
+    def s_lost_netsuite():
+        _lost_slide("NetSuite")
+
+    def s_lost_sage():
+        _lost_slide("Sage")
+
+    def s_pods_review():
+        decision_callout(
+            "Pod reviews — status, wins, risk & exec support (AR)",
+            "AR open-pipeline Commit & Best Case by pod, with each pod's biggest win, top risk and "
+            "the exec support it needs.",
+            "Clear the exec-support asks; protect Commit and convert Best Case.")
+        ardf = df_full[df_full["use_case"].fillna("").str.upper().str.contains("AR")]
+        if ardf.empty:
+            st.info("No open AR pipeline to review.")
+            return
+        detail = analytics.pod_detail(ardf)
+        cb = ardf.groupby("pod").apply(
+            lambda g: pd.Series({"commit": g.loc[g.forecast_cat == "Commit", "acv"].sum(),
+                                 "best": g.loc[g.forecast_cat == "Best Case", "acv"].sum()}))
+        rows = list(detail.head(6).iterrows())
+        for i in range(0, len(rows), 2):
+            cc = st.columns(2)
+            for j, col in enumerate(cc):
+                if i + j >= len(rows):
+                    continue
+                _, p = rows[i + j]
+                commit = float(cb.loc[p["pod"], "commit"]) if p["pod"] in cb.index else 0.0
+                best = float(cb.loc[p["pod"], "best"]) if p["pod"] in cb.index else 0.0
+                stat = {"Green": GOOD, "Yellow": "#b45309", "Red": BAD}.get(p["status"], MUTE)
+                col.markdown(
+                    f"<div style='background:#fff;border:1px solid #e2e8f0;border-top:4px solid {stat};"
+                    f"border-radius:12px;padding:14px 16px;margin-bottom:10px'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                    f"<span style='font-weight:800;font-size:1.1rem;color:{INK}'>{p['pod']}</span>"
+                    f"<span style='background:{stat}1f;color:{stat};font-weight:800;font-size:.72rem;"
+                    f"padding:3px 10px;border-radius:6px'>{p['status'].upper()}</span></div>"
+                    f"<div style='margin:6px 0;color:#334155;font-size:.9rem'>"
+                    f"<b>Commit</b> {money(commit)} &nbsp;·&nbsp; <b>Best Case</b> {money(best)}</div>"
+                    f"<div style='font-size:.84rem;color:#475569;line-height:1.5'>"
+                    f"<b>Biggest win:</b> {p['biggest_win']}<br>"
+                    f"<b>Top risk:</b> {p['biggest_risk']}<br>"
+                    f"<b>Exec support:</b> {p['exec_support']}</div></div>", unsafe_allow_html=True)
+
     def drill_extras():
         st.markdown("### Wins")
         won = load_won(today.isoformat())
@@ -1793,29 +2010,23 @@ else:
         st.dataframe(df[cc].sort_values("acv", ascending=False), use_container_width=True, hide_index=True)
 
     SLIDES = [
-        {"id": "exec", "title": "Executive Forecast", "hs": "pods",
-         "sub": "Will we hit the number? Week / Month / Quarter forecast, coverage and discipline.",
-         "render": s_exec},
-        {"id": "pace", "title": "Bookings Pace", "hs": "pipeline",
+        {"id": "bk_section", "title": "Bookings", "render": s_booking_divider},
+        {"id": "pace", "title": "Bookings Pace",
          "sub": "QTD bookings vs prior quarter, the 4-quarter average pace, and run-rate forecast.",
          "render": s_pace},
-        {"id": "movement", "title": "Forecast Movement", "hs": "waterfall",
-         "sub": "What changed in the forecast week-over-week.", "render": s_movement},
-        {"id": "market", "title": "Market Forecast View", "hs": "funnel",
-         "sub": "Which markets carry the forecast — and the risk.", "render": s_market},
-        {"id": "product", "title": "Product & Product × Market", "hs": "pipeline",
-         "sub": "Open ACV by product and forecast category, and where it concentrates by market.",
-         "render": s_product},
-        {"id": "gtm", "title": "GTM Engine View", "hs": "sdr",
-         "sub": "Open pipeline ACV by acquisition engine.", "render": s_gtm},
-        {"id": "strategic", "title": "Strategic Priorities", "hs": "funnel",
-         "sub": "The six weekly questions, answered with data.", "render": s_strategic},
-        {"id": "pods", "title": "Pod Reviews", "hs": "pods",
-         "sub": "Status, wins, risks, and exec support by pod.", "render": s_pods},
-        {"id": "watchlist", "title": "Deal Watchlist", "hs": "pipeline",
-         "sub": "Largest at-risk deals with recommended forecast actions.", "render": s_watchlist},
-        {"id": "actions", "title": "Actions & Decisions",
-         "sub": "Decisions, owners, and follow-ups from today.", "render": s_actions},
+        {"id": "ar_forecast", "title": "AR Forecast — QTD",
+         "sub": "Will we hit the number? Closed Won, Pipeline, Commit & Best Case by ERP.",
+         "render": s_ar_forecast},
+        {"id": "fc_movement", "title": "Forecast Movement",
+         "sub": "What changed in the forecast week-over-week for the quarter.", "render": s_fc_movement},
+        {"id": "lost_all", "title": "Lost Deals — All",
+         "sub": "Where are we losing this quarter? By primary loss reason.", "render": s_lost_all},
+        {"id": "lost_netsuite", "title": "Lost Deals — NetSuite",
+         "sub": "Where are we losing this quarter in NetSuite?", "render": s_lost_netsuite},
+        {"id": "lost_sage", "title": "Lost Deals — Sage",
+         "sub": "Where are we losing this quarter in Sage?", "render": s_lost_sage},
+        {"id": "pods", "title": "Pod Reviews",
+         "sub": "Status, Commit/Best, wins, risks and exec support by pod.", "render": s_pods_review},
     ]
 
 
@@ -1831,7 +2042,10 @@ total = len(SLIDES)
 NON_FILTERABLE = {"weekly", "trends", "movement", "pace",
                   # Proposal TOF deck slides compute from proposal.py over the full population.
                   "title", "section", "exec", "bookings", "keystats", "wr_erp", "wr_gtm", "gtmperf",
-                  "velocity", "conversion", "product", "diagnostics"}
+                  "velocity", "conversion", "product", "diagnostics",
+                  # Boss's AR Bookings deck — every slide is AR-scoped inside proposal.py.
+                  "bk_section", "ar_forecast", "fc_movement", "lost_all", "lost_netsuite",
+                  "lost_sage", "pods"}
 
 if present:
     # Single source of truth for the current slide. The dropdown is bound to this same
