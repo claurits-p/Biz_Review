@@ -1251,15 +1251,20 @@ if meeting == "TOF Review":
                 else:
                     fg, bg = ((GOOD, GOOD_BG) if v >= 20 else
                               (("#b45309", "#fef3c7") if v >= 10 else (BAD, BAD_BG)))
-                    nstr = "" if pd.isna(n) else f"<div style='font-size:.64rem;color:#94a3b8'>n={int(n)}</div>"
+                    if pd.isna(n):
+                        nstr = ""
+                    else:
+                        won = round(v / 100 * n)
+                        nstr = (f"<div style='font-size:.66rem;color:#64748b'>{won} of {int(n)} "
+                                f"won</div>")
                     tds += (f"<td style='padding:9px;text-align:center;background:{bg};border:2px solid #fff'>"
                             f"<span style='color:{fg};font-weight:800'>{v:.0f}%</span>{nstr}</td>")
             body += f"<tr><td style='padding:9px 14px;font-weight:700;color:#334155'>{seg}</td>{tds}</tr>"
         st.markdown(f"<table style='width:100%;border-collapse:collapse;font-size:.9rem'>"
                     f"<thead><tr style='background:{NAVY};color:#fff'>{head}</tr></thead>"
                     f"<tbody>{body}</tbody></table>", unsafe_allow_html=True)
-        st.caption("Cells coloured by win rate — green ≥20%, amber 10–20%, red <10%; n = closed deals in the cell. "
-                   "Low-n cells are noisy.")
+        st.caption("Cells coloured by win rate — green ≥20%, amber 10–20%, red <10%. The sub-line shows "
+                   "won out of closed deals (what the % is built from); cells with few closed deals are noisy.")
 
     def p_winrate_erp():
         _winrate_slide("erp", "Where are we winning? (segment × ERP)")
